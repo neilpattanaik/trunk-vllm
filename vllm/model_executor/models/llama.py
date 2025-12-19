@@ -37,6 +37,7 @@ from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -406,60 +407,10 @@ class LlamaModel(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
-        # Split-forward configuration (experimental)
-        import vllm.envs as envs
-
-        self.split_forward_enabled = envs.VLLM_SPLIT_FORWARD_ENABLE
-        self.split_forward_boundary = envs.VLLM_SPLIT_FORWARD_BOUNDARY
-        self.split_forward_capture_hb = envs.VLLM_SPLIT_FORWARD_CAPTURE_HB
-        self.debug_save_hb = envs.VLLM_DEBUG_SAVE_HB
-        self.debug_suffix_kv_prefill = envs.VLLM_DEBUG_SUFFIX_KV_PREFILL
-        self.debug_suffix_switch = envs.VLLM_DEBUG_SUFFIX_SWITCH
-        self.debug_boundary_layer = envs.VLLM_DEBUG_BOUNDARY_LAYER
-        if self.split_forward_enabled:
-            if self.split_forward_boundary is None:
-                raise ValueError(
-                    "VLLM_SPLIT_FORWARD_BOUNDARY must be set when "
-                    "VLLM_SPLIT_FORWARD_ENABLE is True"
-                )
-            if not (0 < self.split_forward_boundary < config.num_hidden_layers):
-                raise ValueError(
-                    f"VLLM_SPLIT_FORWARD_BOUNDARY={self.split_forward_boundary} must be "
-                    f"between 0 and {config.num_hidden_layers}"
-                )
-        if self.debug_save_hb:
-            if self.debug_boundary_layer is None:
-                raise ValueError(
-                    "VLLM_DEBUG_BOUNDARY_LAYER must be set when "
-                    "VLLM_DEBUG_SAVE_HB is True"
-                )
-            if not (0 < self.debug_boundary_layer < config.num_hidden_layers):
-                raise ValueError(
-                    f"VLLM_DEBUG_BOUNDARY_LAYER={self.debug_boundary_layer} must be "
-                    f"between 0 and {config.num_hidden_layers}"
-                )
-        if self.debug_suffix_kv_prefill:
-            if self.debug_boundary_layer is None:
-                raise ValueError(
-                    "VLLM_DEBUG_BOUNDARY_LAYER must be set when "
-                    "VLLM_DEBUG_SUFFIX_KV_PREFILL is True"
-                )
-            if not (0 < self.debug_boundary_layer < config.num_hidden_layers):
-                raise ValueError(
-                    f"VLLM_DEBUG_BOUNDARY_LAYER={self.debug_boundary_layer} must be "
-                    f"between 0 and {config.num_hidden_layers}"
-                )
-        if self.debug_suffix_switch:
-            if self.debug_boundary_layer is None:
-                raise ValueError(
-                    "VLLM_DEBUG_BOUNDARY_LAYER must be set when "
-                    "VLLM_DEBUG_SUFFIX_SWITCH is True"
-                )
-            if not (0 < self.debug_boundary_layer < config.num_hidden_layers):
-                raise ValueError(
-                    f"VLLM_DEBUG_BOUNDARY_LAYER={self.debug_boundary_layer} must be "
-                    f"between 0 and {config.num_hidden_layers}"
-                )
+        # Split-forward configuration (experimental). The runner configures
+        # these fields directly when needed.
+        self.split_forward_enabled = False
+        self.split_forward_boundary: int | None = None
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -474,36 +425,26 @@ class LlamaModel(nn.Module):
         torch.Tensor
         | IntermediateTensors
         | tuple[torch.Tensor, list[torch.Tensor]]
-        | tuple[torch.Tensor, torch.Tensor]
     ):
-        # Check if split-forward is enabled
-        if (
-            self.split_forward_enabled
-            or self.debug_save_hb
-            or self.debug_suffix_kv_prefill
-            or self.debug_suffix_switch
-        ):
-            boundary_layer = (
-                self.split_forward_boundary
-                if self.split_forward_enabled
-                else self.debug_boundary_layer
-            )
-            # Use split-forward path
+        boundary_capture = None
+        if is_forward_context_available():
+            boundary_capture = get_forward_context().boundary_capture
+
+        use_split_forward = self.split_forward_enabled or boundary_capture is not None
+        if use_split_forward:
+            if self.split_forward_boundary is None:
+                raise ValueError("split_forward_boundary must be set.")
+            boundary_layer = self.split_forward_boundary
             H_B = self.forward_trunk(
                 input_ids, positions, boundary_layer, inputs_embeds
             )
-            need_return_hb = (
-                self.split_forward_capture_hb
-                or self.debug_save_hb
-                or self.debug_suffix_kv_prefill
-                or self.debug_suffix_switch
-            )
-            H_B_for_suffix = H_B.clone() if need_return_hb else H_B
+            H_B_for_suffix = H_B
+            if boundary_capture is not None:
+                boundary_capture(H_B)
+                H_B_for_suffix = H_B.clone()
             hidden_states = self.forward_suffix(
                 H_B_for_suffix, positions, boundary_layer
             )
-            if need_return_hb:
-                return hidden_states, H_B
             return hidden_states
 
         # Standard forward path

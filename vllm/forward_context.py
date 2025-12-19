@@ -5,7 +5,7 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 
 import torch
 
@@ -196,6 +196,7 @@ class ForwardContext:
     attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]]
     # TODO: remove after making all virtual_engines share the same kv cache
     virtual_engine: int  # set dynamically for each forward pass
+    boundary_capture: Callable[[torch.Tensor], None] | None = None
     # set dynamically for each forward pass
     dp_metadata: DPMetadata | None = None
     # determine the cudagraph style at runtime to be FULL, PIECEWISE, or NONE.
@@ -235,11 +236,13 @@ def create_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
+    boundary_capture: Callable[[torch.Tensor], None] | None = None,
 ):
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
         virtual_engine=virtual_engine,
         attn_metadata=attn_metadata,
+        boundary_capture=boundary_capture,
         dp_metadata=dp_metadata,
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
@@ -272,6 +275,7 @@ def set_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
+    boundary_capture: Callable[[torch.Tensor], None] | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -317,6 +321,7 @@ def set_forward_context(
         cudagraph_runtime_mode,
         batch_descriptor,
         ubatch_slices,
+        boundary_capture,
     )
 
     try:

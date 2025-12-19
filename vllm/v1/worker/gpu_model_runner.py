@@ -291,6 +291,8 @@ class GPUModelRunner(
         self.observability_config = vllm_config.observability_config
         self._split_forward_capture_hb = envs.VLLM_SPLIT_FORWARD_CAPTURE_HB
         self._split_forward_capture_dir = envs.VLLM_SPLIT_FORWARD_CAPTURE_DIR
+        self._split_forward_enabled = envs.VLLM_SPLIT_FORWARD_ENABLE
+        self._split_forward_boundary = envs.VLLM_SPLIT_FORWARD_BOUNDARY
         self._debug_hb_store: dict[str, list[torch.Tensor]] = {}
         self._debug_suffix_from_boundary = envs.VLLM_DEBUG_SUFFIX_FROM_BOUNDARY
         self._debug_boundary_layer = envs.VLLM_DEBUG_BOUNDARY_LAYER
@@ -307,6 +309,13 @@ class GPUModelRunner(
         self._debug_suffix_switch_done: set[str] = set()
         self._suffix_cache_mgr: SuffixCacheManager | None = None
         self._boundary_store: BoundaryStore | None = None
+        self._split_forward_active = (
+            self._split_forward_enabled
+            or self._debug_save_hb
+            or self._debug_suffix_kv_prefill
+            or self._debug_suffix_switch
+        )
+        self._split_forward_boundary_active: int | None = None
 
         if self._debug_suffix_switch:
             if self._debug_boundary_layer is None:
@@ -324,6 +333,23 @@ class GPUModelRunner(
                     "VLLM_DEBUG_OUT_PATH must be set when "
                     "VLLM_DEBUG_SUFFIX_SWITCH is True"
                 )
+
+        if self._split_forward_active:
+            boundary = (
+                self._split_forward_boundary
+                if self._split_forward_enabled
+                else self._debug_boundary_layer
+            )
+            if boundary is None:
+                raise ValueError(
+                    "Boundary layer must be set when split-forward is enabled."
+                )
+            num_layers = self.model_config.hf_config.num_hidden_layers
+            if not (0 < boundary < num_layers):
+                raise ValueError(
+                    f"Boundary layer {boundary} must be between 0 and {num_layers}"
+                )
+            self._split_forward_boundary_active = boundary
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
@@ -794,6 +820,20 @@ class GPUModelRunner(
     # Note: used for model runner override.
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
+
+    def _configure_split_forward_model(self) -> None:
+        model = self.get_model()
+        target = model
+        if not hasattr(target, "split_forward_enabled"):
+            for attr in ("model", "module"):
+                inner = getattr(model, attr, None)
+                if inner is not None and hasattr(inner, "split_forward_enabled"):
+                    target = inner
+                    break
+        if not hasattr(target, "split_forward_enabled"):
+            return
+        target.split_forward_enabled = self._split_forward_active
+        target.split_forward_boundary = self._split_forward_boundary_active
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
@@ -3658,6 +3698,28 @@ class GPUModelRunner(
             self.calculate_kv_scales = False
 
         self._maybe_switch_suffix_kv_cache(is_prefill)
+        if self._split_forward_active:
+            self._configure_split_forward_model()
+
+        hb_for_debug: torch.Tensor | None = None
+        boundary_capture = None
+        if self._split_forward_active and (
+            self._split_forward_capture_hb
+            or self._debug_save_hb
+            or self._debug_suffix_kv_prefill
+            or self._debug_suffix_switch
+        ):
+            def _boundary_capture(hb: torch.Tensor) -> None:
+                nonlocal hb_for_debug
+                hb_for_debug = hb
+                self._capture_boundary_hb(
+                    hb,
+                    self.input_batch.req_ids,
+                    num_scheduled_tokens_np,
+                    num_tokens_unpadded,
+                )
+
+            boundary_capture = _boundary_capture
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -3670,6 +3732,7 @@ class GPUModelRunner(
                 cudagraph_runtime_mode=cudagraph_mode,
                 batch_descriptor=batch_desc,
                 ubatch_slices=ubatch_slices_padded,
+                boundary_capture=boundary_capture,
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
@@ -3683,35 +3746,13 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            hb = None
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
             else:
                 # Common case.
                 aux_hidden_states = None
-                if (
-                    (
-                        self._split_forward_capture_hb
-                        or self._debug_save_hb
-                        or self._debug_suffix_kv_prefill
-                        or self._debug_suffix_switch
-                    )
-                    and isinstance(model_output, tuple)
-                    and len(model_output) == 2
-                    and isinstance(model_output[1], torch.Tensor)
-                ):
-                    hidden_states, hb = model_output
-                else:
-                    hidden_states = model_output
-
-            if hb is not None:
-                self._capture_boundary_hb(
-                    hb,
-                    self.input_batch.req_ids,
-                    num_scheduled_tokens_np,
-                    num_tokens_unpadded,
-                )
+                hidden_states = model_output
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -3753,7 +3794,7 @@ class GPUModelRunner(
                     self._debug_save_hb or self._debug_suffix_only_from_hb_path
                 ):
                     if self._debug_save_hb:
-                        self._save_debug_hb(hb, num_tokens_unpadded)
+                        self._save_debug_hb(hb_for_debug, num_tokens_unpadded)
                     if self._debug_suffix_only_from_hb_path:
                         with set_forward_context(
                             attn_metadata,
@@ -3780,7 +3821,7 @@ class GPUModelRunner(
                         ubatch_slices=ubatch_slices_padded,
                     ):
                         self._run_suffix_kv_prefill_from_hb(
-                            hb,
+                            hb_for_debug,
                             positions,
                             num_tokens_unpadded,
                         )
@@ -4316,6 +4357,7 @@ class GPUModelRunner(
                         aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
 
                     self.model.set_aux_hidden_state_layers(aux_layers)
+                self._configure_split_forward_model()
                 time_after_load = time.perf_counter()
             self.model_memory_usage = m.consumed_memory
         except torch.cuda.OutOfMemoryError as e:
@@ -4891,20 +4933,7 @@ class GPUModelRunner(
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
-                if (
-                    (
-                        self._split_forward_capture_hb
-                        or self._debug_save_hb
-                        or self._debug_suffix_kv_prefill
-                        or self._debug_suffix_switch
-                    )
-                    and isinstance(outputs, tuple)
-                    and len(outputs) == 2
-                    and isinstance(outputs[1], torch.Tensor)
-                ):
-                    hidden_states, _ = outputs
-                else:
-                    hidden_states = outputs
+                hidden_states = outputs
 
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)
