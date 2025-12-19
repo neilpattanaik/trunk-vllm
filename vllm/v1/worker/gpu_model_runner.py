@@ -307,6 +307,7 @@ class GPUModelRunner(
         self._debug_logprobs_k = envs.VLLM_DEBUG_LOGPROBS_K
         self._debug_suffix_switch_store: dict[str, dict[str, Any]] = {}
         self._debug_suffix_switch_done: set[str] = set()
+        self._pending_suffix_switch: dict[str, dict[str, int]] = {}
         self._suffix_cache_mgr: SuffixCacheManager | None = None
         self._boundary_store: BoundaryStore | None = None
         self._split_forward_active = (
@@ -849,6 +850,8 @@ class GPUModelRunner(
             self._dump_boundary_hb(scheduler_output.finished_req_ids)
         if self._debug_suffix_switch:
             self._dump_suffix_switch_debug(scheduler_output.finished_req_ids)
+        for req_id in scheduler_output.finished_req_ids:
+            self._pending_suffix_switch.pop(req_id, None)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1470,43 +1473,66 @@ class GPUModelRunner(
 
         return attn_metadata
 
-    def _maybe_switch_suffix_kv_cache(
+    def request_suffix_switch(
         self,
-        is_prefill: bool,
+        req_id: str,
+        *,
+        suffix_id: int,
+        target_len: int,
+        prompt_len: int | None = None,
     ) -> None:
-        if not self._debug_suffix_switch or is_prefill:
-            return
+        if not req_id:
+            raise ValueError("req_id must be non-empty.")
+        if suffix_id not in (0, 1):
+            raise ValueError(f"suffix_id must be 0 or 1, got {suffix_id}.")
+        if target_len <= 0:
+            raise ValueError(f"target_len must be positive, got {target_len}.")
+        if prompt_len is None:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                raise RuntimeError(
+                    f"Cannot infer prompt_len for req_id={req_id}."
+                )
+            prompt_len = req_state.num_prompt_tokens
+        self._pending_suffix_switch[req_id] = {
+            "suffix_id": suffix_id,
+            "target_len": int(target_len),
+            "prompt_len": int(prompt_len),
+        }
+
+    def _execute_suffix_switch(
+        self,
+        req_id: str,
+        *,
+        suffix_id: int,
+        target_len: int,
+        prompt_len: int,
+    ) -> None:
         if self.input_batch.num_reqs != 1:
-            raise RuntimeError("Debug suffix switch only supports batch size 1.")
-        assert self._debug_boundary_layer is not None
-        assert self._debug_switch_after is not None
-
-        req_id = self.input_batch.req_ids[0]
-        if req_id in self._debug_suffix_switch_done:
-            return
-        req_idx = 0
-        prompt_len = int(self.input_batch.num_prompt_tokens[req_idx])
-        num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
-        target_len = prompt_len + self._debug_switch_after
-        if num_computed != target_len:
-            return
-
+            raise RuntimeError("Suffix switch only supports batch size 1.")
+        boundary_layer = (
+            self._debug_boundary_layer
+            if self._debug_boundary_layer is not None
+            else self._split_forward_boundary_active
+        )
+        if boundary_layer is None:
+            raise RuntimeError("Boundary layer is not configured for suffix switch.")
         if self._boundary_store is None:
             raise RuntimeError("Boundary store is not initialized.")
+        if self._suffix_cache_mgr is None:
+            raise RuntimeError("Suffix cache manager is not initialized.")
+        if not hasattr(self.model, "forward_suffix_prefill_from_hb"):
+            raise RuntimeError("Model does not support suffix prefill from H_B.")
         hb = self._boundary_store.get_prefix(req_id, target_len)
         if self._debug_hb_path:
             os.makedirs(os.path.dirname(self._debug_hb_path) or ".", exist_ok=True)
             torch.save(hb.detach().cpu().contiguous(), self._debug_hb_path)
 
-        if self._suffix_cache_mgr is None:
-            raise RuntimeError("Suffix cache manager is not initialized.")
-        if not hasattr(self.model, "forward_suffix_prefill_from_hb"):
-            raise RuntimeError("Model does not support suffix prefill from H_B.")
-        self._suffix_cache_mgr.set_active_suffix(1)
+        self._suffix_cache_mgr.set_active_suffix(suffix_id)
         self._suffix_cache_mgr.rebuild_from_boundary(
             model=self.model,
             hb=hb,
-            boundary_layer=self._debug_boundary_layer,
+            boundary_layer=boundary_layer,
             prompt_len=prompt_len,
             target_len=target_len,
             device=self.device,
@@ -1516,7 +1542,64 @@ class GPUModelRunner(
             build_decode_attn_metadata=self._build_suffix_switch_decode_attn_metadata,
         )
 
-        self._debug_suffix_switch_done.add(req_id)
+    def _maybe_execute_suffix_switch(
+        self,
+        is_prefill: bool,
+    ) -> None:
+        if is_prefill:
+            return
+        if not self._pending_suffix_switch:
+            return
+        if self.input_batch.num_reqs != 1:
+            raise RuntimeError("Suffix switch only supports batch size 1.")
+        req_id = self.input_batch.req_ids[0]
+        pending = self._pending_suffix_switch.get(req_id)
+        if pending is None:
+            return
+        target_len = pending["target_len"]
+        prompt_len = pending["prompt_len"]
+        if self._boundary_store is None:
+            raise RuntimeError("Boundary store is not initialized.")
+        if self._boundary_store.num_tokens(req_id) < target_len:
+            return
+        self._execute_suffix_switch(
+            req_id,
+            suffix_id=pending["suffix_id"],
+            target_len=target_len,
+            prompt_len=prompt_len,
+        )
+        self._pending_suffix_switch.pop(req_id, None)
+        if self._debug_suffix_switch:
+            self._debug_suffix_switch_done.add(req_id)
+
+    def _maybe_switch_suffix_kv_cache(
+        self,
+        is_prefill: bool,
+    ) -> None:
+        if self._debug_suffix_switch and not is_prefill:
+            if self.input_batch.num_reqs != 1:
+                raise RuntimeError("Debug suffix switch only supports batch size 1.")
+            assert self._debug_boundary_layer is not None
+            assert self._debug_switch_after is not None
+
+            req_id = self.input_batch.req_ids[0]
+            if (
+                req_id not in self._debug_suffix_switch_done
+                and req_id not in self._pending_suffix_switch
+            ):
+                req_idx = 0
+                prompt_len = int(self.input_batch.num_prompt_tokens[req_idx])
+                num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                target_len = prompt_len + self._debug_switch_after
+                if num_computed == target_len:
+                    self.request_suffix_switch(
+                        req_id,
+                        suffix_id=1,
+                        target_len=target_len,
+                        prompt_len=prompt_len,
+                    )
+
+        self._maybe_execute_suffix_switch(is_prefill)
 
     def _record_suffix_switch_logprobs(
         self,
