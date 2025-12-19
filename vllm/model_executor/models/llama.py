@@ -508,9 +508,13 @@ class LlamaModel(nn.Module):
         residual = None
 
         # Run through trunk layers [0..boundary_layer-1]
-        for layer_idx in range(boundary_layer):
-            layer = self.layers[layer_idx]
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        hidden_states, residual = self._run_layers_range(
+            hidden_states,
+            residual,
+            positions,
+            start=0,
+            end=boundary_layer,
+        )
 
         # Combine hidden_states and residual to get complete H_B
         if residual is not None:
@@ -542,14 +546,31 @@ class LlamaModel(nn.Module):
 
         # Run through suffix layers [boundary_layer..end]
         num_layers = len(self.layers)
-        for layer_idx in range(boundary_layer, num_layers):
-            layer = self.layers[layer_idx]
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        hidden_states, residual = self._run_layers_range(
+            hidden_states,
+            residual,
+            positions,
+            start=boundary_layer,
+            end=num_layers,
+        )
 
         # Apply final norm
         hidden_states, _ = self.norm(hidden_states, residual)
 
         return hidden_states
+
+    def _run_layers_range(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor,
+        start: int,
+        end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        for layer_idx in range(start, end):
+            layer = self.layers[layer_idx]
+            hidden_states, residual = layer(positions, hidden_states, residual)
+        return hidden_states, residual
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [

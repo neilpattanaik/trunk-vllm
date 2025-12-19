@@ -249,6 +249,9 @@ if TYPE_CHECKING:
     VLLM_SPLIT_FORWARD_BOUNDARY: int | None = None
     VLLM_SPLIT_FORWARD_CAPTURE_HB: bool = False
     VLLM_SPLIT_FORWARD_CAPTURE_DIR: str | None = None
+    VLLM_DEBUG_SUFFIX_FROM_BOUNDARY: bool = False
+    VLLM_DEBUG_BOUNDARY_LAYER: int | None = None
+    VLLM_DEBUG_OUT_PATH: str | None = None
 
 
 def get_default_cache_root():
@@ -1591,6 +1594,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPLIT_FORWARD_CAPTURE_DIR": lambda: os.getenv(
         "VLLM_SPLIT_FORWARD_CAPTURE_DIR", None
     ),
+    # Debug: compare logits from full vs suffix-only forward.
+    "VLLM_DEBUG_SUFFIX_FROM_BOUNDARY": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_SUFFIX_FROM_BOUNDARY", "0"))
+    ),
+    "VLLM_DEBUG_BOUNDARY_LAYER": lambda: maybe_convert_int(
+        os.getenv("VLLM_DEBUG_BOUNDARY_LAYER", None)
+    ),
+    "VLLM_DEBUG_OUT_PATH": lambda: os.getenv("VLLM_DEBUG_OUT_PATH", None),
 }
 
 # --8<-- [end:env-vars-definition]

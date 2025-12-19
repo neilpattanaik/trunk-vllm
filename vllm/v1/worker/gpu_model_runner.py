@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import json
 import os
 import time
 from collections import defaultdict
@@ -288,6 +289,9 @@ class GPUModelRunner(
         self._split_forward_capture_hb = envs.VLLM_SPLIT_FORWARD_CAPTURE_HB
         self._split_forward_capture_dir = envs.VLLM_SPLIT_FORWARD_CAPTURE_DIR
         self._debug_hb_store: dict[str, list[torch.Tensor]] = {}
+        self._debug_suffix_from_boundary = envs.VLLM_DEBUG_SUFFIX_FROM_BOUNDARY
+        self._debug_boundary_layer = envs.VLLM_DEBUG_BOUNDARY_LAYER
+        self._debug_out_path = envs.VLLM_DEBUG_OUT_PATH
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
@@ -1074,6 +1078,57 @@ class GPUModelRunner(
                 self._split_forward_capture_dir, f"{safe_req_id}.pt"
             )
             torch.save(hb, hb_path)
+
+    def _dump_suffix_from_boundary_debug(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        num_tokens_unpadded: int,
+    ) -> None:
+        if not self._debug_suffix_from_boundary:
+            return
+        if self._debug_boundary_layer is None:
+            raise RuntimeError("VLLM_DEBUG_BOUNDARY_LAYER must be set.")
+        if not self._debug_out_path:
+            raise RuntimeError("VLLM_DEBUG_OUT_PATH must be set.")
+        if num_tokens_unpadded <= 0:
+            return
+        if not hasattr(self.model, "forward_split_logits"):
+            raise RuntimeError("Model does not support forward_split_logits.")
+
+        logits_full = self.model.compute_logits(hidden_states)
+        logits_split, _ = self.model.forward_split_logits(
+            input_ids=input_ids,
+            positions=positions,
+            boundary_layer=self._debug_boundary_layer,
+            inputs_embeds=inputs_embeds,
+        )
+
+        logits_full = logits_full[:num_tokens_unpadded]
+        logits_split = logits_split[:num_tokens_unpadded]
+        diff = (logits_full - logits_split).abs()
+        max_abs_diff = diff.max().item()
+        mean_abs_diff = diff.mean().item()
+        token_full = int(torch.argmax(logits_full[-1]).item())
+        token_split = int(torch.argmax(logits_split[-1]).item())
+        token_match = token_full == token_split
+
+        out = {
+            "boundary_layer": self._debug_boundary_layer,
+            "num_tokens": int(num_tokens_unpadded),
+            "max_abs_diff": max_abs_diff,
+            "mean_abs_diff": mean_abs_diff,
+            "token_full": token_full,
+            "token_split": token_split,
+            "token_match": token_match,
+            "logits_full_shape": list(logits_full.shape),
+            "logits_split_shape": list(logits_split.shape),
+        }
+        os.makedirs(os.path.dirname(self._debug_out_path) or ".", exist_ok=True)
+        with open(self._debug_out_path, "w", encoding="utf-8") as f:
+            json.dump(out, f)
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor
@@ -3253,6 +3308,23 @@ class GPUModelRunner(
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+                if self._debug_suffix_from_boundary:
+                    with set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        cudagraph_runtime_mode=cudagraph_mode,
+                        batch_descriptor=batch_desc,
+                        ubatch_slices=ubatch_slices_padded,
+                    ):
+                        self._dump_suffix_from_boundary_debug(
+                            input_ids,
+                            positions,
+                            inputs_embeds,
+                            hidden_states,
+                            num_tokens_unpadded,
+                        )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
