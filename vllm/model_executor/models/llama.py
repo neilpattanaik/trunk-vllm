@@ -406,6 +406,22 @@ class LlamaModel(nn.Module):
             ["hidden_states", "residual"], config.hidden_size
         )
 
+        # Split-forward configuration (experimental)
+        import vllm.envs as envs
+        self.split_forward_enabled = envs.VLLM_SPLIT_FORWARD_ENABLE
+        self.split_forward_boundary = envs.VLLM_SPLIT_FORWARD_BOUNDARY
+        if self.split_forward_enabled:
+            if self.split_forward_boundary is None:
+                raise ValueError(
+                    "VLLM_SPLIT_FORWARD_BOUNDARY must be set when "
+                    "VLLM_SPLIT_FORWARD_ENABLE is True"
+                )
+            if not (0 < self.split_forward_boundary < config.num_hidden_layers):
+                raise ValueError(
+                    f"VLLM_SPLIT_FORWARD_BOUNDARY={self.split_forward_boundary} must be "
+                    f"between 0 and {config.num_hidden_layers}"
+                )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -416,6 +432,16 @@ class LlamaModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        # Check if split-forward is enabled
+        if self.split_forward_enabled:
+            # Use split-forward path
+            H_B = self.forward_trunk(
+                input_ids, positions, self.split_forward_boundary, inputs_embeds
+            )
+            hidden_states = self.forward_suffix(H_B, positions, self.split_forward_boundary)
+            return hidden_states
+
+        # Standard forward path
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -444,6 +470,77 @@ class LlamaModel(nn.Module):
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
+        return hidden_states
+
+    def forward_trunk(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        boundary_layer: int,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Run trunk forward pass through layers [0..boundary_layer-1].
+        Returns the hidden state H_B after completing layer boundary_layer-1.
+
+        Args:
+            input_ids: Input token IDs [batch, seq_len]
+            positions: Position IDs [batch, seq_len]
+            boundary_layer: Boundary layer index B (runs layers [0..B-1])
+            inputs_embeds: Optional input embeddings
+
+        Returns:
+            H_B: Combined hidden state after trunk layers [batch, seq_len, hidden_size]
+        """
+        # Start from embeddings
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            hidden_states = self.embed_input_ids(input_ids)
+        residual = None
+
+        # Run through trunk layers [0..boundary_layer-1]
+        for layer_idx in range(boundary_layer):
+            layer = self.layers[layer_idx]
+            hidden_states, residual = layer(positions, hidden_states, residual)
+
+        # Combine hidden_states and residual to get complete H_B
+        if residual is not None:
+            H_B = hidden_states + residual
+        else:
+            H_B = hidden_states
+
+        return H_B
+
+    def forward_suffix(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        boundary_layer: int,
+    ) -> torch.Tensor:
+        """
+        Run suffix forward pass through layers [boundary_layer..L-1] starting from H_B.
+
+        Args:
+            hidden_states: Input hidden state H_B [batch, seq_len, hidden_size]
+            positions: Position IDs [batch, seq_len]
+            boundary_layer: Boundary layer index B (runs layers [B..L-1])
+
+        Returns:
+            final_hidden_states: Output after suffix layers and final norm [batch, seq_len, hidden_size]
+        """
+        # Start suffix with fresh residual stream
+        residual = None
+
+        # Run through suffix layers [boundary_layer..end]
+        num_layers = len(self.layers)
+        for layer_idx in range(boundary_layer, num_layers):
+            layer = self.layers[layer_idx]
+            hidden_states, residual = layer(positions, hidden_states, residual)
+
+        # Apply final norm
+        hidden_states, _ = self.norm(hidden_states, residual)
+
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -631,6 +728,62 @@ class LlamaForCausalLM(
     ) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
+
+    def forward_full_logits(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Run full forward pass and return logits.
+
+        Args:
+            input_ids: Input token IDs [batch, seq_len]
+            positions: Position IDs [batch, seq_len]
+            inputs_embeds: Optional input embeddings
+
+        Returns:
+            logits: Output logits [batch, seq_len, vocab_size]
+        """
+        hidden_states = self.model(
+            input_ids, positions, intermediate_tensors=None, inputs_embeds=inputs_embeds
+        )
+        logits = self.compute_logits(hidden_states)
+        return logits
+
+    def forward_split_logits(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        boundary_layer: int,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run split forward pass (trunk + suffix) and return logits and H_B.
+
+        Args:
+            input_ids: Input token IDs [batch, seq_len]
+            positions: Position IDs [batch, seq_len]
+            boundary_layer: Boundary layer index B (trunk runs [0..B-1], suffix runs [B..L-1])
+            inputs_embeds: Optional input embeddings
+
+        Returns:
+            logits: Output logits [batch, seq_len, vocab_size]
+            H_B: Hidden state after trunk [batch, seq_len, hidden_size]
+        """
+        # Run trunk forward
+        H_B = self.model.forward_trunk(
+            input_ids, positions, boundary_layer, inputs_embeds=inputs_embeds
+        )
+
+        # Run suffix forward
+        hidden_states = self.model.forward_suffix(H_B, positions, boundary_layer)
+
+        # Compute logits
+        logits = self.compute_logits(hidden_states)
+
+        return logits, H_B
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(

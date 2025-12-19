@@ -245,6 +245,8 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
+    VLLM_SPLIT_FORWARD_ENABLE: bool = False
+    VLLM_SPLIT_FORWARD_BOUNDARY: int | None = None
 
 
 def get_default_cache_root():
@@ -1570,6 +1572,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
+    ),
+    # Enable split-forward for speculative decoding
+    "VLLM_SPLIT_FORWARD_ENABLE": lambda: bool(
+        int(os.getenv("VLLM_SPLIT_FORWARD_ENABLE", "0"))
+    ),
+    # Boundary layer for split-forward (0 < B < num_layers)
+    "VLLM_SPLIT_FORWARD_BOUNDARY": lambda: maybe_convert_int(
+        os.getenv("VLLM_SPLIT_FORWARD_BOUNDARY", None)
     ),
 }
 
