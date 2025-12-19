@@ -292,6 +292,11 @@ class GPUModelRunner(
         self._debug_suffix_from_boundary = envs.VLLM_DEBUG_SUFFIX_FROM_BOUNDARY
         self._debug_boundary_layer = envs.VLLM_DEBUG_BOUNDARY_LAYER
         self._debug_out_path = envs.VLLM_DEBUG_OUT_PATH
+        self._debug_save_hb = envs.VLLM_DEBUG_SAVE_HB
+        self._debug_hb_out_path = envs.VLLM_DEBUG_HB_OUT_PATH
+        self._debug_suffix_only_from_hb_path = (
+            envs.VLLM_DEBUG_SUFFIX_ONLY_FROM_HB_PATH
+        )
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
@@ -1125,6 +1130,83 @@ class GPUModelRunner(
             "token_match": token_match,
             "logits_full_shape": list(logits_full.shape),
             "logits_split_shape": list(logits_split.shape),
+        }
+        os.makedirs(os.path.dirname(self._debug_out_path) or ".", exist_ok=True)
+        with open(self._debug_out_path, "w", encoding="utf-8") as f:
+            json.dump(out, f)
+
+    def _save_debug_hb(
+        self,
+        hb: torch.Tensor | None,
+        num_tokens_unpadded: int,
+    ) -> None:
+        if not self._debug_save_hb:
+            return
+        if not self._debug_hb_out_path:
+            raise RuntimeError("VLLM_DEBUG_HB_OUT_PATH must be set.")
+        if hb is None:
+            raise RuntimeError("H_B was not captured for debug save.")
+        if num_tokens_unpadded <= 0:
+            return
+
+        hb_to_save = hb[:num_tokens_unpadded]
+        if hb_to_save.dim() == 3 and hb_to_save.size(0) == 1:
+            hb_to_save = hb_to_save[0]
+        hb_to_save = hb_to_save.detach().cpu().contiguous()
+        os.makedirs(os.path.dirname(self._debug_hb_out_path) or ".", exist_ok=True)
+        torch.save(hb_to_save, self._debug_hb_out_path)
+
+    def _dump_suffix_only_from_hb_debug(
+        self,
+        positions: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        num_tokens_unpadded: int,
+    ) -> None:
+        if not self._debug_suffix_only_from_hb_path:
+            return
+        if self._debug_boundary_layer is None:
+            raise RuntimeError("VLLM_DEBUG_BOUNDARY_LAYER must be set.")
+        if not self._debug_out_path:
+            raise RuntimeError("VLLM_DEBUG_OUT_PATH must be set.")
+        if positions is None:
+            raise RuntimeError("positions is required for suffix-only debug.")
+        if num_tokens_unpadded <= 0:
+            return
+
+        hb = torch.load(self._debug_suffix_only_from_hb_path, map_location="cpu")
+        if hb.dim() == 3 and hb.size(0) == 1:
+            hb = hb[0]
+        hb = hb[:num_tokens_unpadded].to(
+            device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        pos = positions[:num_tokens_unpadded]
+
+        logits_suffix_last = self.model.forward_suffix_only_last_logit_from_hb(
+            hb,
+            pos,
+            self._debug_boundary_layer,
+        )
+
+        last_hidden = hidden_states[:num_tokens_unpadded][-1:].contiguous()
+        logits_full_last = self.model.compute_logits(last_hidden)[0]
+
+        diff = (logits_full_last - logits_suffix_last).abs()
+        max_abs_diff = diff.max().item()
+        mean_abs_diff = diff.mean().item()
+        token_full = int(torch.argmax(logits_full_last).item())
+        token_suffix = int(torch.argmax(logits_suffix_last).item())
+        token_match = token_full == token_suffix
+
+        out = {
+            "boundary_layer": self._debug_boundary_layer,
+            "num_tokens": int(num_tokens_unpadded),
+            "max_abs_diff": max_abs_diff,
+            "mean_abs_diff": mean_abs_diff,
+            "token_full": token_full,
+            "token_suffix": token_suffix,
+            "token_match": token_match,
+            "logits_full_last_shape": list(logits_full_last.shape),
+            "logits_suffix_last_shape": list(logits_suffix_last.shape),
         }
         os.makedirs(os.path.dirname(self._debug_out_path) or ".", exist_ok=True)
         with open(self._debug_out_path, "w", encoding="utf-8") as f:
@@ -3140,6 +3222,7 @@ class GPUModelRunner(
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+                is_prefill = bool(scheduler_output.scheduled_new_reqs)
 
                 (
                     logits_indices,
@@ -3272,7 +3355,7 @@ class GPUModelRunner(
                 # Common case.
                 aux_hidden_states = None
                 if (
-                    self._split_forward_capture_hb
+                    (self._split_forward_capture_hb or self._debug_save_hb)
                     and isinstance(model_output, tuple)
                     and len(model_output) == 2
                     and isinstance(model_output[1], torch.Tensor)
@@ -3325,6 +3408,24 @@ class GPUModelRunner(
                             hidden_states,
                             num_tokens_unpadded,
                         )
+                if is_prefill and (self._debug_save_hb or self._debug_suffix_only_from_hb_path):
+                    if self._debug_save_hb:
+                        self._save_debug_hb(hb, num_tokens_unpadded)
+                    if self._debug_suffix_only_from_hb_path:
+                        with set_forward_context(
+                            attn_metadata,
+                            self.vllm_config,
+                            num_tokens=num_tokens_padded,
+                            num_tokens_across_dp=num_tokens_across_dp,
+                            cudagraph_runtime_mode=cudagraph_mode,
+                            batch_descriptor=batch_desc,
+                            ubatch_slices=ubatch_slices_padded,
+                        ):
+                            self._dump_suffix_only_from_hb_debug(
+                                positions,
+                                hidden_states,
+                                num_tokens_unpadded,
+                            )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4428,7 +4529,7 @@ class GPUModelRunner(
                 hidden_states, _ = outputs
             else:
                 if (
-                    self._split_forward_capture_hb
+                    (self._split_forward_capture_hb or self._debug_save_hb)
                     and isinstance(outputs, tuple)
                     and len(outputs) == 2
                     and isinstance(outputs[1], torch.Tensor)

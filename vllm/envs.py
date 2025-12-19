@@ -252,6 +252,9 @@ if TYPE_CHECKING:
     VLLM_DEBUG_SUFFIX_FROM_BOUNDARY: bool = False
     VLLM_DEBUG_BOUNDARY_LAYER: int | None = None
     VLLM_DEBUG_OUT_PATH: str | None = None
+    VLLM_DEBUG_SAVE_HB: bool = False
+    VLLM_DEBUG_HB_OUT_PATH: str | None = None
+    VLLM_DEBUG_SUFFIX_ONLY_FROM_HB_PATH: str | None = None
 
 
 def get_default_cache_root():
@@ -1602,6 +1605,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_DEBUG_BOUNDARY_LAYER", None)
     ),
     "VLLM_DEBUG_OUT_PATH": lambda: os.getenv("VLLM_DEBUG_OUT_PATH", None),
+    "VLLM_DEBUG_SAVE_HB": lambda: bool(int(os.getenv("VLLM_DEBUG_SAVE_HB", "0"))),
+    "VLLM_DEBUG_HB_OUT_PATH": lambda: os.getenv("VLLM_DEBUG_HB_OUT_PATH", None),
+    "VLLM_DEBUG_SUFFIX_ONLY_FROM_HB_PATH": lambda: os.getenv(
+        "VLLM_DEBUG_SUFFIX_ONLY_FROM_HB_PATH", None
+    ),
 }
 
 # --8<-- [end:env-vars-definition]
