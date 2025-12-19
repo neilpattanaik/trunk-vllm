@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any
@@ -9,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
@@ -80,6 +82,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self._split_forward_capture_hb = envs.VLLM_SPLIT_FORWARD_CAPTURE_HB
+        self._split_forward_capture_dir = envs.VLLM_SPLIT_FORWARD_CAPTURE_DIR
+        self._debug_hb_store: dict[str, list[torch.Tensor]] = {}
 
         self.device = device
         self.pin_memory = is_pin_memory_available()
@@ -283,10 +288,19 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_tokens_across_dp=num_tokens_across_dp,
             ),
         ):
-            hidden_states = self.model(
+            model_output = self.model(
                 input_ids=input_batch.input_ids,
                 positions=input_batch.positions,
             )
+            if (
+                self._split_forward_capture_hb
+                and isinstance(model_output, tuple)
+                and len(model_output) == 2
+                and isinstance(model_output[1], torch.Tensor)
+            ):
+                hidden_states, _ = model_output
+            else:
+                hidden_states = model_output
             sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
 
@@ -375,6 +389,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             torch.cuda.synchronize()
 
     def update_states(self, scheduler_output: SchedulerOutput) -> None:
+        if self._split_forward_capture_hb:
+            self._dump_boundary_hb(scheduler_output.finished_req_ids)
         if scheduler_output.preempted_req_ids is not None:
             for req_id in scheduler_output.preempted_req_ids:
                 self.req_states.remove_request(req_id)
@@ -437,6 +453,63 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 new_block_ids=new_block_ids,
                 overwrite=overwrite,
             )
+
+    @staticmethod
+    def _sanitize_req_id(req_id: str) -> str:
+        safe_chars = []
+        for ch in req_id:
+            if ch.isalnum() or ch in "-_.":
+                safe_chars.append(ch)
+            else:
+                safe_chars.append("_")
+        return "".join(safe_chars)
+
+    def _capture_boundary_hb(
+        self,
+        hb: torch.Tensor,
+        input_batch: InputBatch,
+    ) -> None:
+        if not self._split_forward_capture_hb:
+            return
+        if input_batch.num_tokens <= 0:
+            return
+
+        hb = hb[: input_batch.num_tokens]
+        offset = 0
+        for req_id, num_tokens in zip(
+            input_batch.req_ids, input_batch.num_scheduled_tokens.tolist()
+        ):
+            if num_tokens <= 0:
+                continue
+            hb_slice = hb[offset : offset + num_tokens]
+            offset += num_tokens
+            if hb_slice.numel() == 0:
+                continue
+            hb_slice = hb_slice.detach()
+            if hb_slice.is_cuda:
+                hb_slice = hb_slice.cpu()
+            hb_slice = hb_slice.contiguous()
+            self._debug_hb_store.setdefault(req_id, []).append(hb_slice)
+
+    def _dump_boundary_hb(self, finished_req_ids: list[str]) -> None:
+        if not self._split_forward_capture_hb:
+            return
+        if not finished_req_ids:
+            return
+        if not self._split_forward_capture_dir:
+            return
+
+        os.makedirs(self._split_forward_capture_dir, exist_ok=True)
+        for req_id in finished_req_ids:
+            hb_chunks = self._debug_hb_store.pop(req_id, None)
+            if not hb_chunks:
+                continue
+            hb = torch.cat(hb_chunks, dim=0)
+            safe_req_id = self._sanitize_req_id(req_id)
+            hb_path = os.path.join(
+                self._split_forward_capture_dir, f"{safe_req_id}.pt"
+            )
+            torch.save(hb, hb_path)
 
     def prepare_inputs(
         self,
@@ -921,6 +994,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata = None
 
         # Run model.
+        hb = None
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Run CUDA graph.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
@@ -938,10 +1012,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_runtime_mode=cudagraph_mode,
                 num_tokens_across_dp=num_tokens_across_dp,
             ):
-                hidden_states = self.model(
+                model_output = self.model(
                     input_ids=input_batch.input_ids,
                     positions=input_batch.positions,
                 )
+                if (
+                    self._split_forward_capture_hb
+                    and isinstance(model_output, tuple)
+                    and len(model_output) == 2
+                    and isinstance(model_output[1], torch.Tensor)
+                ):
+                    hidden_states, hb = model_output
+                else:
+                    hidden_states = model_output
+
+        if hb is not None:
+            self._capture_boundary_hb(hb, input_batch)
 
         self.execute_model_state = hidden_states, input_batch, sampling_metadata
         return None

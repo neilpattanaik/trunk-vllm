@@ -410,6 +410,7 @@ class LlamaModel(nn.Module):
         import vllm.envs as envs
         self.split_forward_enabled = envs.VLLM_SPLIT_FORWARD_ENABLE
         self.split_forward_boundary = envs.VLLM_SPLIT_FORWARD_BOUNDARY
+        self.split_forward_capture_hb = envs.VLLM_SPLIT_FORWARD_CAPTURE_HB
         if self.split_forward_enabled:
             if self.split_forward_boundary is None:
                 raise ValueError(
@@ -431,7 +432,12 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+    ) -> (
+        torch.Tensor
+        | IntermediateTensors
+        | tuple[torch.Tensor, list[torch.Tensor]]
+        | tuple[torch.Tensor, torch.Tensor]
+    ):
         # Check if split-forward is enabled
         if self.split_forward_enabled:
             # Use split-forward path
@@ -439,6 +445,8 @@ class LlamaModel(nn.Module):
                 input_ids, positions, self.split_forward_boundary, inputs_embeds
             )
             hidden_states = self.forward_suffix(H_B, positions, self.split_forward_boundary)
+            if self.split_forward_capture_hb:
+                return hidden_states, H_B
             return hidden_states
 
         # Standard forward path

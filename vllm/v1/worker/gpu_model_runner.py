@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
@@ -284,6 +285,9 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self._split_forward_capture_hb = envs.VLLM_SPLIT_FORWARD_CAPTURE_HB
+        self._split_forward_capture_dir = envs.VLLM_SPLIT_FORWARD_CAPTURE_DIR
+        self._debug_hb_store: dict[str, list[torch.Tensor]] = {}
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
@@ -760,6 +764,8 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        if self._split_forward_capture_hb:
+            self._dump_boundary_hb(scheduler_output.finished_req_ids)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1011,6 +1017,63 @@ class GPUModelRunner(
         self._may_reorder_batch(scheduler_output)
         # Refresh batch metadata with any pending updates.
         self.input_batch.refresh_metadata()
+
+    @staticmethod
+    def _sanitize_req_id(req_id: str) -> str:
+        safe_chars = []
+        for ch in req_id:
+            if ch.isalnum() or ch in "-_.":
+                safe_chars.append(ch)
+            else:
+                safe_chars.append("_")
+        return "".join(safe_chars)
+
+    def _capture_boundary_hb(
+        self,
+        hb: torch.Tensor,
+        req_ids: Sequence[str],
+        num_scheduled_tokens_np: np.ndarray,
+        num_tokens_unpadded: int,
+    ) -> None:
+        if not self._split_forward_capture_hb:
+            return
+        if num_tokens_unpadded <= 0:
+            return
+
+        hb = hb[:num_tokens_unpadded]
+        offset = 0
+        for req_id, num_tokens in zip(req_ids, num_scheduled_tokens_np.tolist()):
+            if num_tokens <= 0:
+                continue
+            hb_slice = hb[offset : offset + num_tokens]
+            offset += num_tokens
+            if hb_slice.numel() == 0:
+                continue
+            hb_slice = hb_slice.detach()
+            if hb_slice.is_cuda:
+                hb_slice = hb_slice.cpu()
+            hb_slice = hb_slice.contiguous()
+            self._debug_hb_store.setdefault(req_id, []).append(hb_slice)
+
+    def _dump_boundary_hb(self, finished_req_ids: Sequence[str]) -> None:
+        if not self._split_forward_capture_hb:
+            return
+        if not finished_req_ids:
+            return
+        if not self._split_forward_capture_dir:
+            return
+
+        os.makedirs(self._split_forward_capture_dir, exist_ok=True)
+        for req_id in finished_req_ids:
+            hb_chunks = self._debug_hb_store.pop(req_id, None)
+            if not hb_chunks:
+                continue
+            hb = torch.cat(hb_chunks, dim=0)
+            safe_req_id = self._sanitize_req_id(req_id)
+            hb_path = os.path.join(
+                self._split_forward_capture_dir, f"{safe_req_id}.pt"
+            )
+            torch.save(hb, hb_path)
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor
@@ -3146,13 +3209,30 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+            hb = None
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
             else:
                 # Common case.
-                hidden_states = model_output
                 aux_hidden_states = None
+                if (
+                    self._split_forward_capture_hb
+                    and isinstance(model_output, tuple)
+                    and len(model_output) == 2
+                    and isinstance(model_output[1], torch.Tensor)
+                ):
+                    hidden_states, hb = model_output
+                else:
+                    hidden_states = model_output
+
+            if hb is not None:
+                self._capture_boundary_hb(
+                    hb,
+                    self.input_batch.req_ids,
+                    num_scheduled_tokens_np,
+                    num_tokens_unpadded,
+                )
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -4275,7 +4355,15 @@ class GPUModelRunner(
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
-                hidden_states = outputs
+                if (
+                    self._split_forward_capture_hb
+                    and isinstance(outputs, tuple)
+                    and len(outputs) == 2
+                    and isinstance(outputs[1], torch.Tensor)
+                ):
+                    hidden_states, _ = outputs
+                else:
+                    hidden_states = outputs
 
             if self.speculative_config and self.speculative_config.use_eagle():
                 assert isinstance(self.drafter, EagleProposer)

@@ -247,6 +247,8 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_SPLIT_FORWARD_ENABLE: bool = False
     VLLM_SPLIT_FORWARD_BOUNDARY: int | None = None
+    VLLM_SPLIT_FORWARD_CAPTURE_HB: bool = False
+    VLLM_SPLIT_FORWARD_CAPTURE_DIR: str | None = None
 
 
 def get_default_cache_root():
@@ -1580,6 +1582,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Boundary layer for split-forward (0 < B < num_layers)
     "VLLM_SPLIT_FORWARD_BOUNDARY": lambda: maybe_convert_int(
         os.getenv("VLLM_SPLIT_FORWARD_BOUNDARY", None)
+    ),
+    # Enable capture of boundary activations H_B for split-forward.
+    "VLLM_SPLIT_FORWARD_CAPTURE_HB": lambda: bool(
+        int(os.getenv("VLLM_SPLIT_FORWARD_CAPTURE_HB", "0"))
+    ),
+    # Directory to dump per-request boundary activation tensors.
+    "VLLM_SPLIT_FORWARD_CAPTURE_DIR": lambda: os.getenv(
+        "VLLM_SPLIT_FORWARD_CAPTURE_DIR", None
     ),
 }
 
