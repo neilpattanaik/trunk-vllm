@@ -506,9 +506,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 continue
             hb = torch.cat(hb_chunks, dim=0)
             safe_req_id = self._sanitize_req_id(req_id)
-            hb_path = os.path.join(
-                self._split_forward_capture_dir, f"{safe_req_id}.pt"
-            )
+            hb_path = os.path.join(self._split_forward_capture_dir, f"{safe_req_id}.pt")
             torch.save(hb, hb_path)
 
     def prepare_inputs(

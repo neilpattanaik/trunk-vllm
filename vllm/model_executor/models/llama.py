@@ -408,6 +408,7 @@ class LlamaModel(nn.Module):
 
         # Split-forward configuration (experimental)
         import vllm.envs as envs
+
         self.split_forward_enabled = envs.VLLM_SPLIT_FORWARD_ENABLE
         self.split_forward_boundary = envs.VLLM_SPLIT_FORWARD_BOUNDARY
         self.split_forward_capture_hb = envs.VLLM_SPLIT_FORWARD_CAPTURE_HB

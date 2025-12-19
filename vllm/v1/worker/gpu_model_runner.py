@@ -62,7 +62,6 @@ from vllm.model_executor.layers.rotary_embedding import (
     XDRotaryEmbedding,
 )
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.models.interfaces import (
     SupportsMRoPE,
     SupportsMultiModal,
@@ -112,6 +111,8 @@ from vllm.v1.attention.backends.utils import (
     reorder_batch_to_split_decodes_and_prefills,
     split_attn_metadata,
 )
+from vllm.v1.worker.shared_trunk.boundary_store import BoundaryStore
+from vllm.v1.worker.shared_trunk.suffix_cache_manager import SuffixCacheManager
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -296,9 +297,7 @@ class GPUModelRunner(
         self._debug_out_path = envs.VLLM_DEBUG_OUT_PATH
         self._debug_save_hb = envs.VLLM_DEBUG_SAVE_HB
         self._debug_hb_out_path = envs.VLLM_DEBUG_HB_OUT_PATH
-        self._debug_suffix_only_from_hb_path = (
-            envs.VLLM_DEBUG_SUFFIX_ONLY_FROM_HB_PATH
-        )
+        self._debug_suffix_only_from_hb_path = envs.VLLM_DEBUG_SUFFIX_ONLY_FROM_HB_PATH
         self._debug_suffix_kv_prefill = envs.VLLM_DEBUG_SUFFIX_KV_PREFILL
         self._debug_hb_path = envs.VLLM_DEBUG_HB_PATH
         self._debug_suffix_switch = envs.VLLM_DEBUG_SUFFIX_SWITCH
@@ -306,10 +305,8 @@ class GPUModelRunner(
         self._debug_logprobs_k = envs.VLLM_DEBUG_LOGPROBS_K
         self._debug_suffix_switch_store: dict[str, dict[str, Any]] = {}
         self._debug_suffix_switch_done: set[str] = set()
-        self._debug_suffix_kv_cache_a: dict[str, torch.Tensor] = {}
-        self._debug_suffix_kv_cache_b: dict[str, torch.Tensor] = {}
-        self._debug_suffix_attn_layers: dict[str, AttentionLayerBase] = {}
-        self._debug_suffix_kv_mode: str = "A"
+        self._suffix_cache_mgr: SuffixCacheManager | None = None
+        self._boundary_store: BoundaryStore | None = None
 
         if self._debug_suffix_switch:
             if self._debug_boundary_layer is None:
@@ -339,6 +336,11 @@ class GPUModelRunner(
         self.device = device
         self.pin_memory = is_pin_memory_available()
         self.dtype = self.model_config.dtype
+        if self._debug_suffix_switch:
+            self._boundary_store = BoundaryStore(
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             cache_config.cache_dtype, self.model_config
@@ -1090,7 +1092,10 @@ class GPUModelRunner(
             offset += num_tokens
             if hb_slice.numel() == 0:
                 continue
-            if self._debug_suffix_switch and req_id not in self._debug_suffix_switch_store:
+            if (
+                self._debug_suffix_switch
+                and req_id not in self._debug_suffix_switch_store
+            ):
                 req_state = self.requests.get(req_id)
                 prompt_len = (
                     req_state.num_prompt_tokens if req_state is not None else None
@@ -1102,11 +1107,19 @@ class GPUModelRunner(
                     "boundary_layer": self._debug_boundary_layer,
                     "switch_after": self._debug_switch_after,
                 }
+                if self._boundary_store is not None:
+                    self._boundary_store.init_for_request(req_id)
             hb_slice = hb_slice.detach()
-            if hb_slice.is_cuda:
-                hb_slice = hb_slice.cpu()
-            hb_slice = hb_slice.contiguous()
-            self._debug_hb_store.setdefault(req_id, []).append(hb_slice)
+            if self._debug_suffix_switch:
+                if self._boundary_store is None:
+                    raise RuntimeError("Boundary store is not initialized.")
+                self._boundary_store.append(req_id, hb_slice)
+            if self._split_forward_capture_hb:
+                hb_cpu = hb_slice
+                if hb_cpu.is_cuda:
+                    hb_cpu = hb_cpu.cpu()
+                hb_cpu = hb_cpu.contiguous()
+                self._debug_hb_store.setdefault(req_id, []).append(hb_cpu)
 
     def _dump_boundary_hb(self, finished_req_ids: Sequence[str]) -> None:
         if not self._split_forward_capture_hb:
@@ -1123,9 +1136,7 @@ class GPUModelRunner(
                 continue
             hb = torch.cat(hb_chunks, dim=0)
             safe_req_id = self._sanitize_req_id(req_id)
-            hb_path = os.path.join(
-                self._split_forward_capture_dir, f"{safe_req_id}.pt"
-            )
+            hb_path = os.path.join(self._split_forward_capture_dir, f"{safe_req_id}.pt")
             torch.save(hb, hb_path)
 
     def _dump_suffix_from_boundary_debug(
@@ -1297,55 +1308,15 @@ class GPUModelRunner(
     ) -> None:
         if not self._debug_suffix_switch:
             return
-        assert self._debug_boundary_layer is not None
-
-        self._debug_suffix_attn_layers.clear()
-        self._debug_suffix_kv_cache_a.clear()
-        self._debug_suffix_kv_cache_b.clear()
-
-        attn_layers = get_layers_from_vllm_config(
-            self.vllm_config, AttentionLayerBase
+        if self._debug_boundary_layer is None:
+            raise RuntimeError("VLLM_DEBUG_BOUNDARY_LAYER must be set.")
+        self._suffix_cache_mgr = SuffixCacheManager(
+            boundary_layer=self._debug_boundary_layer,
         )
-        for layer_name, attn_module in attn_layers.items():
-            try:
-                layer_idx = extract_layer_index(layer_name)
-            except AssertionError:
-                continue
-            if layer_idx < self._debug_boundary_layer:
-                continue
-            kv_cache = kv_caches.get(layer_name)
-            if kv_cache is None:
-                continue
-            self._debug_suffix_attn_layers[layer_name] = attn_module
-            self._debug_suffix_kv_cache_a[layer_name] = kv_cache
-            self._debug_suffix_kv_cache_b[layer_name] = torch.empty_like(kv_cache)
-
-        if not self._debug_suffix_attn_layers:
-            raise RuntimeError(
-                "No suffix attention layers found for debug suffix switch."
-            )
-        self._debug_suffix_kv_mode = "A"
-
-    def _set_suffix_kv_cache_mode(self, mode: str) -> None:
-        if not self._debug_suffix_switch:
-            return
-        if mode == self._debug_suffix_kv_mode:
-            return
-        if mode not in ("A", "B"):
-            raise ValueError(f"Unknown suffix KV mode: {mode}")
-
-        kv_map = (
-            self._debug_suffix_kv_cache_a
-            if mode == "A"
-            else self._debug_suffix_kv_cache_b
+        self._suffix_cache_mgr.initialize_from_kv_caches(
+            self.vllm_config,
+            kv_caches,
         )
-        for layer_name, kv_cache in kv_map.items():
-            attn_module = self._debug_suffix_attn_layers[layer_name]
-            if not attn_module.kv_cache:
-                attn_module.kv_cache = [kv_cache]
-            else:
-                attn_module.kv_cache[0] = kv_cache
-        self._debug_suffix_kv_mode = mode
 
     def _compute_slot_mapping_for_req(
         self,
@@ -1378,9 +1349,7 @@ class GPUModelRunner(
         for gid, kv_cache_group in enumerate(kv_cache_groups):
             block_table = self.input_batch.block_table[gid]
             block_table_tensor = block_table.get_device_tensor(num_reqs)
-            slot_mapping = self._compute_slot_mapping_for_req(
-                block_table, total_len
-            )
+            slot_mapping = self._compute_slot_mapping_for_req(block_table, total_len)
 
             common = CommonAttentionMetadata(
                 query_start_loc=query_start_loc_gpu,
@@ -1482,67 +1451,30 @@ class GPUModelRunner(
         if num_computed != target_len:
             return
 
-        hb_chunks = self._debug_hb_store.get(req_id)
-        if not hb_chunks:
-            raise RuntimeError("No H_B cache found for suffix switch.")
-        hb = torch.cat(hb_chunks, dim=0)
-        if hb.size(0) < target_len:
-            raise RuntimeError(
-                f"Insufficient H_B cached tokens: {hb.size(0)} < {target_len}"
-            )
-        hb = hb[:target_len]
+        if self._boundary_store is None:
+            raise RuntimeError("Boundary store is not initialized.")
+        hb = self._boundary_store.get_prefix(req_id, target_len)
         if self._debug_hb_path:
             os.makedirs(os.path.dirname(self._debug_hb_path) or ".", exist_ok=True)
             torch.save(hb.detach().cpu().contiguous(), self._debug_hb_path)
 
-        hb = hb.to(device=self.device, dtype=self.dtype)
-        self._set_suffix_kv_cache_mode("B")
-        if prompt_len > 0:
-            hb_prompt = hb[:prompt_len]
-            positions_prompt = torch.arange(
-                prompt_len, device=self.device, dtype=torch.int64
-            )
-            attn_metadata = self._build_suffix_switch_attn_metadata(prompt_len)
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=prompt_len,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            ):
-                if hasattr(self.model, "forward_suffix_prefill_from_hb"):
-                    self.model.forward_suffix_prefill_from_hb(
-                        hb_prompt,
-                        positions_prompt,
-                        self._debug_boundary_layer,
-                    )
-                else:
-                    raise RuntimeError(
-                        "Model does not support suffix prefill from H_B."
-                    )
-
-        for offset in range(target_len - prompt_len):
-            position = prompt_len + offset
-            hb_token = hb[position : position + 1]
-            positions = torch.tensor(
-                [position], device=self.device, dtype=torch.int64
-            )
-            attn_metadata = self._build_suffix_switch_decode_attn_metadata(position)
-            with set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=1,
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            ):
-                if hasattr(self.model, "forward_suffix_prefill_from_hb"):
-                    self.model.forward_suffix_prefill_from_hb(
-                        hb_token,
-                        positions,
-                        self._debug_boundary_layer,
-                    )
-                else:
-                    raise RuntimeError(
-                        "Model does not support suffix prefill from H_B."
-                    )
+        if self._suffix_cache_mgr is None:
+            raise RuntimeError("Suffix cache manager is not initialized.")
+        if not hasattr(self.model, "forward_suffix_prefill_from_hb"):
+            raise RuntimeError("Model does not support suffix prefill from H_B.")
+        self._suffix_cache_mgr.set_active_suffix(1)
+        self._suffix_cache_mgr.rebuild_from_boundary(
+            model=self.model,
+            hb=hb,
+            boundary_layer=self._debug_boundary_layer,
+            prompt_len=prompt_len,
+            target_len=target_len,
+            device=self.device,
+            dtype=self.dtype,
+            vllm_config=self.vllm_config,
+            build_prefill_attn_metadata=self._build_suffix_switch_attn_metadata,
+            build_decode_attn_metadata=self._build_suffix_switch_decode_attn_metadata,
+        )
 
         self._debug_suffix_switch_done.add(req_id)
 
@@ -1600,18 +1532,19 @@ class GPUModelRunner(
 
         for req_id in finished_req_ids:
             debug = self._debug_suffix_switch_store.pop(req_id, None)
-            if debug is None:
-                continue
-            req_state = self.requests.get(req_id)
-            if req_state is not None:
-                debug["prompt_len"] = req_state.num_prompt_tokens
-                debug["total_len"] = req_state.num_tokens
-            os.makedirs(os.path.dirname(self._debug_out_path) or ".", exist_ok=True)
-            with open(self._debug_out_path, "w", encoding="utf-8") as f:
-                json.dump(debug, f)
-            self._debug_hb_store.pop(req_id, None)
+            if debug is not None:
+                req_state = self.requests.get(req_id)
+                if req_state is not None:
+                    debug["prompt_len"] = req_state.num_prompt_tokens
+                    debug["total_len"] = req_state.num_tokens
+                os.makedirs(os.path.dirname(self._debug_out_path) or ".", exist_ok=True)
+                with open(self._debug_out_path, "w", encoding="utf-8") as f:
+                    json.dump(debug, f)
+            if self._boundary_store is not None:
+                self._boundary_store.free(req_id)
             self._debug_suffix_switch_done.discard(req_id)
-        self._set_suffix_kv_cache_mode("A")
+        if self._suffix_cache_mgr is not None:
+            self._suffix_cache_mgr.set_active_suffix(0)
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor
@@ -3816,7 +3749,9 @@ class GPUModelRunner(
                             hidden_states,
                             num_tokens_unpadded,
                         )
-                if is_prefill and (self._debug_save_hb or self._debug_suffix_only_from_hb_path):
+                if is_prefill and (
+                    self._debug_save_hb or self._debug_suffix_only_from_hb_path
+                ):
                     if self._debug_save_hb:
                         self._save_debug_hb(hb, num_tokens_unpadded)
                     if self._debug_suffix_only_from_hb_path:
