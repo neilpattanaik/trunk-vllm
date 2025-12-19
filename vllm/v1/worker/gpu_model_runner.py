@@ -62,6 +62,7 @@ from vllm.model_executor.layers.rotary_embedding import (
     XDRotaryEmbedding,
 )
 from vllm.model_executor.model_loader import TensorizerLoader, get_model_loader
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.model_executor.models.interfaces import (
     SupportsMRoPE,
     SupportsMultiModal,
@@ -148,6 +149,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+from vllm.v1.worker.block_table import BlockTable
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -299,6 +301,32 @@ class GPUModelRunner(
         )
         self._debug_suffix_kv_prefill = envs.VLLM_DEBUG_SUFFIX_KV_PREFILL
         self._debug_hb_path = envs.VLLM_DEBUG_HB_PATH
+        self._debug_suffix_switch = envs.VLLM_DEBUG_SUFFIX_SWITCH
+        self._debug_switch_after = envs.VLLM_DEBUG_SWITCH_AFTER
+        self._debug_logprobs_k = envs.VLLM_DEBUG_LOGPROBS_K
+        self._debug_suffix_switch_store: dict[str, dict[str, Any]] = {}
+        self._debug_suffix_switch_done: set[str] = set()
+        self._debug_suffix_kv_cache_a: dict[str, torch.Tensor] = {}
+        self._debug_suffix_kv_cache_b: dict[str, torch.Tensor] = {}
+        self._debug_suffix_attn_layers: dict[str, AttentionLayerBase] = {}
+        self._debug_suffix_kv_mode: str = "A"
+
+        if self._debug_suffix_switch:
+            if self._debug_boundary_layer is None:
+                raise ValueError(
+                    "VLLM_DEBUG_BOUNDARY_LAYER must be set when "
+                    "VLLM_DEBUG_SUFFIX_SWITCH is True"
+                )
+            if self._debug_switch_after is None or self._debug_switch_after <= 0:
+                raise ValueError(
+                    "VLLM_DEBUG_SWITCH_AFTER must be set to a positive integer "
+                    "when VLLM_DEBUG_SUFFIX_SWITCH is True"
+                )
+            if not self._debug_out_path:
+                raise ValueError(
+                    "VLLM_DEBUG_OUT_PATH must be set when "
+                    "VLLM_DEBUG_SUFFIX_SWITCH is True"
+                )
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
@@ -777,6 +805,8 @@ class GPUModelRunner(
         """
         if self._split_forward_capture_hb:
             self._dump_boundary_hb(scheduler_output.finished_req_ids)
+        if self._debug_suffix_switch:
+            self._dump_suffix_switch_debug(scheduler_output.finished_req_ids)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1046,7 +1076,7 @@ class GPUModelRunner(
         num_scheduled_tokens_np: np.ndarray,
         num_tokens_unpadded: int,
     ) -> None:
-        if not self._split_forward_capture_hb:
+        if not (self._split_forward_capture_hb or self._debug_suffix_switch):
             return
         if num_tokens_unpadded <= 0:
             return
@@ -1060,6 +1090,18 @@ class GPUModelRunner(
             offset += num_tokens
             if hb_slice.numel() == 0:
                 continue
+            if self._debug_suffix_switch and req_id not in self._debug_suffix_switch_store:
+                req_state = self.requests.get(req_id)
+                prompt_len = (
+                    req_state.num_prompt_tokens if req_state is not None else None
+                )
+                self._debug_suffix_switch_store[req_id] = {
+                    "token_ids": [],
+                    "top_logprobs": [],
+                    "prompt_len": prompt_len,
+                    "boundary_layer": self._debug_boundary_layer,
+                    "switch_after": self._debug_switch_after,
+                }
             hb_slice = hb_slice.detach()
             if hb_slice.is_cuda:
                 hb_slice = hb_slice.cpu()
@@ -1248,6 +1290,328 @@ class GPUModelRunner(
             )
         else:
             raise RuntimeError("Model does not support suffix prefill from H_B.")
+
+    def _init_debug_suffix_switch_kv_cache(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+    ) -> None:
+        if not self._debug_suffix_switch:
+            return
+        assert self._debug_boundary_layer is not None
+
+        self._debug_suffix_attn_layers.clear()
+        self._debug_suffix_kv_cache_a.clear()
+        self._debug_suffix_kv_cache_b.clear()
+
+        attn_layers = get_layers_from_vllm_config(
+            self.vllm_config, AttentionLayerBase
+        )
+        for layer_name, attn_module in attn_layers.items():
+            try:
+                layer_idx = extract_layer_index(layer_name)
+            except AssertionError:
+                continue
+            if layer_idx < self._debug_boundary_layer:
+                continue
+            kv_cache = kv_caches.get(layer_name)
+            if kv_cache is None:
+                continue
+            self._debug_suffix_attn_layers[layer_name] = attn_module
+            self._debug_suffix_kv_cache_a[layer_name] = kv_cache
+            self._debug_suffix_kv_cache_b[layer_name] = torch.empty_like(kv_cache)
+
+        if not self._debug_suffix_attn_layers:
+            raise RuntimeError(
+                "No suffix attention layers found for debug suffix switch."
+            )
+        self._debug_suffix_kv_mode = "A"
+
+    def _set_suffix_kv_cache_mode(self, mode: str) -> None:
+        if not self._debug_suffix_switch:
+            return
+        if mode == self._debug_suffix_kv_mode:
+            return
+        if mode not in ("A", "B"):
+            raise ValueError(f"Unknown suffix KV mode: {mode}")
+
+        kv_map = (
+            self._debug_suffix_kv_cache_a
+            if mode == "A"
+            else self._debug_suffix_kv_cache_b
+        )
+        for layer_name, kv_cache in kv_map.items():
+            attn_module = self._debug_suffix_attn_layers[layer_name]
+            if not attn_module.kv_cache:
+                attn_module.kv_cache = [kv_cache]
+            else:
+                attn_module.kv_cache[0] = kv_cache
+        self._debug_suffix_kv_mode = mode
+
+    def _compute_slot_mapping_for_req(
+        self,
+        block_table: BlockTable,
+        total_len: int,
+        req_idx: int = 0,
+    ) -> torch.Tensor:
+        req_indices = np.full(total_len, req_idx, dtype=np.int32)
+        positions = np.arange(total_len, dtype=np.int32)
+        block_table.compute_slot_mapping(req_indices, positions)
+        slot_mapping_np = block_table.slot_mapping.np[:total_len].copy()
+        slot_mapping = torch.from_numpy(slot_mapping_np.astype(np.int64))
+        return slot_mapping.to(device=self.device)
+
+    def _build_suffix_switch_attn_metadata(
+        self,
+        total_len: int,
+    ) -> dict[str, AttentionMetadata]:
+        num_reqs = 1
+        query_start_loc_cpu = torch.tensor(
+            [0, total_len], dtype=torch.int32, device="cpu"
+        )
+        query_start_loc_gpu = query_start_loc_cpu.to(self.device)
+        seq_lens_np = np.array([total_len], dtype=np.int32)
+        seq_lens = torch.from_numpy(seq_lens_np).to(self.device)
+        num_computed_tokens_cpu = torch.zeros(1, dtype=torch.int32, device="cpu")
+
+        attn_metadata: dict[str, AttentionMetadata] = {}
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        for gid, kv_cache_group in enumerate(kv_cache_groups):
+            block_table = self.input_batch.block_table[gid]
+            block_table_tensor = block_table.get_device_tensor(num_reqs)
+            slot_mapping = self._compute_slot_mapping_for_req(
+                block_table, total_len
+            )
+
+            common = CommonAttentionMetadata(
+                query_start_loc=query_start_loc_gpu,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                _seq_lens_cpu=torch.from_numpy(seq_lens_np),
+                _num_computed_tokens_cpu=num_computed_tokens_cpu,
+                num_reqs=num_reqs,
+                num_actual_tokens=total_len,
+                max_query_len=total_len,
+                max_seq_len=total_len,
+                block_table_tensor=block_table_tensor,
+                slot_mapping=slot_mapping,
+                causal=True,
+            )
+            if not self.attn_groups[gid]:
+                raise RuntimeError("No attention groups available for metadata.")
+            attn_group = self.attn_groups[gid][0]
+            metadata = attn_group.get_metadata_builder().build(
+                common_prefix_len=0,
+                common_attn_metadata=common,
+            )
+            for layer_name in kv_cache_group.layer_names:
+                attn_metadata[layer_name] = metadata
+
+        return attn_metadata
+
+    def _build_suffix_switch_decode_attn_metadata(
+        self,
+        position: int,
+    ) -> dict[str, AttentionMetadata]:
+        num_reqs = 1
+        seq_len = position + 1
+        query_start_loc_cpu = torch.tensor([0, 1], dtype=torch.int32, device="cpu")
+        query_start_loc_gpu = query_start_loc_cpu.to(self.device)
+        seq_lens_np = np.array([seq_len], dtype=np.int32)
+        seq_lens = torch.from_numpy(seq_lens_np).to(self.device)
+        num_computed_tokens_cpu = torch.tensor(
+            [position], dtype=torch.int32, device="cpu"
+        )
+
+        attn_metadata: dict[str, AttentionMetadata] = {}
+        kv_cache_groups = self.kv_cache_config.kv_cache_groups
+        for gid, kv_cache_group in enumerate(kv_cache_groups):
+            block_table = self.input_batch.block_table[gid]
+            block_table_tensor = block_table.get_device_tensor(num_reqs)
+            req_indices = np.array([0], dtype=np.int32)
+            positions = np.array([position], dtype=np.int32)
+            block_table.compute_slot_mapping(req_indices, positions)
+            slot_mapping_np = block_table.slot_mapping.np[:1].copy()
+            slot_mapping = torch.from_numpy(slot_mapping_np.astype(np.int64)).to(
+                self.device
+            )
+
+            common = CommonAttentionMetadata(
+                query_start_loc=query_start_loc_gpu,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                _seq_lens_cpu=torch.from_numpy(seq_lens_np),
+                _num_computed_tokens_cpu=num_computed_tokens_cpu,
+                num_reqs=num_reqs,
+                num_actual_tokens=1,
+                max_query_len=1,
+                max_seq_len=seq_len,
+                block_table_tensor=block_table_tensor,
+                slot_mapping=slot_mapping,
+                causal=True,
+            )
+            if not self.attn_groups[gid]:
+                raise RuntimeError("No attention groups available for metadata.")
+            attn_group = self.attn_groups[gid][0]
+            metadata = attn_group.get_metadata_builder().build(
+                common_prefix_len=0,
+                common_attn_metadata=common,
+            )
+            for layer_name in kv_cache_group.layer_names:
+                attn_metadata[layer_name] = metadata
+
+        return attn_metadata
+
+    def _maybe_switch_suffix_kv_cache(
+        self,
+        is_prefill: bool,
+    ) -> None:
+        if not self._debug_suffix_switch or is_prefill:
+            return
+        if self.input_batch.num_reqs != 1:
+            raise RuntimeError("Debug suffix switch only supports batch size 1.")
+        assert self._debug_boundary_layer is not None
+        assert self._debug_switch_after is not None
+
+        req_id = self.input_batch.req_ids[0]
+        if req_id in self._debug_suffix_switch_done:
+            return
+        req_idx = 0
+        prompt_len = int(self.input_batch.num_prompt_tokens[req_idx])
+        num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+        target_len = prompt_len + self._debug_switch_after
+        if num_computed != target_len:
+            return
+
+        hb_chunks = self._debug_hb_store.get(req_id)
+        if not hb_chunks:
+            raise RuntimeError("No H_B cache found for suffix switch.")
+        hb = torch.cat(hb_chunks, dim=0)
+        if hb.size(0) < target_len:
+            raise RuntimeError(
+                f"Insufficient H_B cached tokens: {hb.size(0)} < {target_len}"
+            )
+        hb = hb[:target_len]
+        if self._debug_hb_path:
+            os.makedirs(os.path.dirname(self._debug_hb_path) or ".", exist_ok=True)
+            torch.save(hb.detach().cpu().contiguous(), self._debug_hb_path)
+
+        hb = hb.to(device=self.device, dtype=self.dtype)
+        self._set_suffix_kv_cache_mode("B")
+        if prompt_len > 0:
+            hb_prompt = hb[:prompt_len]
+            positions_prompt = torch.arange(
+                prompt_len, device=self.device, dtype=torch.int64
+            )
+            attn_metadata = self._build_suffix_switch_attn_metadata(prompt_len)
+            with set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=prompt_len,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            ):
+                if hasattr(self.model, "forward_suffix_prefill_from_hb"):
+                    self.model.forward_suffix_prefill_from_hb(
+                        hb_prompt,
+                        positions_prompt,
+                        self._debug_boundary_layer,
+                    )
+                else:
+                    raise RuntimeError(
+                        "Model does not support suffix prefill from H_B."
+                    )
+
+        for offset in range(target_len - prompt_len):
+            position = prompt_len + offset
+            hb_token = hb[position : position + 1]
+            positions = torch.tensor(
+                [position], device=self.device, dtype=torch.int64
+            )
+            attn_metadata = self._build_suffix_switch_decode_attn_metadata(position)
+            with set_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=1,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            ):
+                if hasattr(self.model, "forward_suffix_prefill_from_hb"):
+                    self.model.forward_suffix_prefill_from_hb(
+                        hb_token,
+                        positions,
+                        self._debug_boundary_layer,
+                    )
+                else:
+                    raise RuntimeError(
+                        "Model does not support suffix prefill from H_B."
+                    )
+
+        self._debug_suffix_switch_done.add(req_id)
+
+    def _record_suffix_switch_logprobs(
+        self,
+        req_ids: Sequence[str],
+        valid_sampled_token_ids: list[list[int]],
+        logprobs_lists: LogprobsLists | None,
+    ) -> None:
+        if not self._debug_suffix_switch:
+            return
+        if logprobs_lists is None:
+            return
+
+        for req_idx, req_id in enumerate(req_ids):
+            if req_id not in self._debug_suffix_switch_store:
+                req_state = self.requests.get(req_id)
+                prompt_len = (
+                    req_state.num_prompt_tokens if req_state is not None else None
+                )
+                self._debug_suffix_switch_store[req_id] = {
+                    "token_ids": [],
+                    "top_logprobs": [],
+                    "prompt_len": prompt_len,
+                    "boundary_layer": self._debug_boundary_layer,
+                    "switch_after": self._debug_switch_after,
+                }
+
+            tokens = valid_sampled_token_ids[req_idx]
+            if not tokens:
+                continue
+            slice_lists = logprobs_lists.slice_request(req_idx, len(tokens))
+            for pos_idx, token_id in enumerate(tokens):
+                token_ids = slice_lists.logprob_token_ids[pos_idx].tolist()
+                logprobs = slice_lists.logprobs[pos_idx].tolist()
+                pairs = []
+                for tid, lp in zip(token_ids, logprobs):
+                    if tid < 0:
+                        continue
+                    pairs.append([int(tid), float(lp)])
+                if self._debug_logprobs_k is not None:
+                    pairs = pairs[: self._debug_logprobs_k]
+                self._debug_suffix_switch_store[req_id]["token_ids"].append(
+                    int(token_id)
+                )
+                self._debug_suffix_switch_store[req_id]["top_logprobs"].append(pairs)
+
+    def _dump_suffix_switch_debug(self, finished_req_ids: Sequence[str]) -> None:
+        if not self._debug_suffix_switch:
+            return
+        if not finished_req_ids:
+            return
+        if not self._debug_out_path:
+            raise RuntimeError("VLLM_DEBUG_OUT_PATH must be set.")
+
+        for req_id in finished_req_ids:
+            debug = self._debug_suffix_switch_store.pop(req_id, None)
+            if debug is None:
+                continue
+            req_state = self.requests.get(req_id)
+            if req_state is not None:
+                debug["prompt_len"] = req_state.num_prompt_tokens
+                debug["total_len"] = req_state.num_tokens
+            os.makedirs(os.path.dirname(self._debug_out_path) or ".", exist_ok=True)
+            with open(self._debug_out_path, "w", encoding="utf-8") as f:
+                json.dump(debug, f)
+            self._debug_hb_store.pop(req_id, None)
+            self._debug_suffix_switch_done.discard(req_id)
+        self._set_suffix_kv_cache_mode("A")
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor
@@ -3360,6 +3724,8 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
+        self._maybe_switch_suffix_kv_cache(is_prefill)
+
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (
@@ -3396,6 +3762,7 @@ class GPUModelRunner(
                         self._split_forward_capture_hb
                         or self._debug_save_hb
                         or self._debug_suffix_kv_prefill
+                        or self._debug_suffix_switch
                     )
                     and isinstance(model_output, tuple)
                     and len(model_output) == 2
@@ -3647,6 +4014,11 @@ class GPUModelRunner(
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
+            )
+            self._record_suffix_switch_logprobs(
+                req_ids_output_copy,
+                valid_sampled_token_ids,
+                logprobs_lists,
             )
 
         if (
@@ -4589,6 +4961,7 @@ class GPUModelRunner(
                         self._split_forward_capture_hb
                         or self._debug_save_hb
                         or self._debug_suffix_kv_prefill
+                        or self._debug_suffix_switch
                     )
                     and isinstance(outputs, tuple)
                     and len(outputs) == 2
@@ -5768,6 +6141,8 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        if self._debug_suffix_switch:
+            self._init_debug_suffix_switch_kv_cache(kv_caches)
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)

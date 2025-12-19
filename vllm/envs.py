@@ -257,6 +257,9 @@ if TYPE_CHECKING:
     VLLM_DEBUG_SUFFIX_ONLY_FROM_HB_PATH: str | None = None
     VLLM_DEBUG_SUFFIX_KV_PREFILL: bool = False
     VLLM_DEBUG_HB_PATH: str | None = None
+    VLLM_DEBUG_SUFFIX_SWITCH: bool = False
+    VLLM_DEBUG_SWITCH_AFTER: int | None = None
+    VLLM_DEBUG_LOGPROBS_K: int | None = None
 
 
 def get_default_cache_root():
@@ -1616,6 +1619,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DEBUG_SUFFIX_KV_PREFILL", "0"))
     ),
     "VLLM_DEBUG_HB_PATH": lambda: os.getenv("VLLM_DEBUG_HB_PATH", None),
+    "VLLM_DEBUG_SUFFIX_SWITCH": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_SUFFIX_SWITCH", "0"))
+    ),
+    "VLLM_DEBUG_SWITCH_AFTER": lambda: maybe_convert_int(
+        os.getenv("VLLM_DEBUG_SWITCH_AFTER", None)
+    ),
+    "VLLM_DEBUG_LOGPROBS_K": lambda: maybe_convert_int(
+        os.getenv("VLLM_DEBUG_LOGPROBS_K", None)
+    ),
 }
 
 # --8<-- [end:env-vars-definition]

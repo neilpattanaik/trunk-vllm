@@ -413,6 +413,7 @@ class LlamaModel(nn.Module):
         self.split_forward_capture_hb = envs.VLLM_SPLIT_FORWARD_CAPTURE_HB
         self.debug_save_hb = envs.VLLM_DEBUG_SAVE_HB
         self.debug_suffix_kv_prefill = envs.VLLM_DEBUG_SUFFIX_KV_PREFILL
+        self.debug_suffix_switch = envs.VLLM_DEBUG_SUFFIX_SWITCH
         self.debug_boundary_layer = envs.VLLM_DEBUG_BOUNDARY_LAYER
         if self.split_forward_enabled:
             if self.split_forward_boundary is None:
@@ -447,6 +448,17 @@ class LlamaModel(nn.Module):
                     f"VLLM_DEBUG_BOUNDARY_LAYER={self.debug_boundary_layer} must be "
                     f"between 0 and {config.num_hidden_layers}"
                 )
+        if self.debug_suffix_switch:
+            if self.debug_boundary_layer is None:
+                raise ValueError(
+                    "VLLM_DEBUG_BOUNDARY_LAYER must be set when "
+                    "VLLM_DEBUG_SUFFIX_SWITCH is True"
+                )
+            if not (0 < self.debug_boundary_layer < config.num_hidden_layers):
+                raise ValueError(
+                    f"VLLM_DEBUG_BOUNDARY_LAYER={self.debug_boundary_layer} must be "
+                    f"between 0 and {config.num_hidden_layers}"
+                )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -464,7 +476,12 @@ class LlamaModel(nn.Module):
         | tuple[torch.Tensor, torch.Tensor]
     ):
         # Check if split-forward is enabled
-        if self.split_forward_enabled or self.debug_save_hb or self.debug_suffix_kv_prefill:
+        if (
+            self.split_forward_enabled
+            or self.debug_save_hb
+            or self.debug_suffix_kv_prefill
+            or self.debug_suffix_switch
+        ):
             boundary_layer = (
                 self.split_forward_boundary
                 if self.split_forward_enabled
@@ -478,6 +495,7 @@ class LlamaModel(nn.Module):
                 self.split_forward_capture_hb
                 or self.debug_save_hb
                 or self.debug_suffix_kv_prefill
+                or self.debug_suffix_switch
             )
             H_B_for_suffix = H_B.clone() if need_return_hb else H_B
             hidden_states = self.forward_suffix(
