@@ -297,6 +297,8 @@ class GPUModelRunner(
         self._debug_suffix_only_from_hb_path = (
             envs.VLLM_DEBUG_SUFFIX_ONLY_FROM_HB_PATH
         )
+        self._debug_suffix_kv_prefill = envs.VLLM_DEBUG_SUFFIX_KV_PREFILL
+        self._debug_hb_path = envs.VLLM_DEBUG_HB_PATH
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
@@ -1211,6 +1213,41 @@ class GPUModelRunner(
         os.makedirs(os.path.dirname(self._debug_out_path) or ".", exist_ok=True)
         with open(self._debug_out_path, "w", encoding="utf-8") as f:
             json.dump(out, f)
+
+    def _run_suffix_kv_prefill_from_hb(
+        self,
+        hb: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        num_tokens_unpadded: int,
+    ) -> None:
+        if not self._debug_suffix_kv_prefill:
+            return
+        if self._debug_boundary_layer is None:
+            raise RuntimeError("VLLM_DEBUG_BOUNDARY_LAYER must be set.")
+        if not self._debug_hb_path:
+            raise RuntimeError("VLLM_DEBUG_HB_PATH must be set.")
+        if hb is None:
+            raise RuntimeError("H_B was not captured for suffix KV prefill.")
+        if positions is None:
+            raise RuntimeError("positions is required for suffix KV prefill.")
+        if num_tokens_unpadded <= 0:
+            return
+
+        hb_slice = hb[:num_tokens_unpadded]
+        hb_cpu = hb_slice.detach().cpu().contiguous()
+        os.makedirs(os.path.dirname(self._debug_hb_path) or ".", exist_ok=True)
+        torch.save(hb_cpu, self._debug_hb_path)
+
+        hb_for_suffix = hb_slice.clone()
+        pos = positions[:num_tokens_unpadded]
+        if hasattr(self.model, "forward_suffix_prefill_from_hb"):
+            self.model.forward_suffix_prefill_from_hb(
+                hb_for_suffix,
+                pos,
+                self._debug_boundary_layer,
+            )
+        else:
+            raise RuntimeError("Model does not support suffix prefill from H_B.")
 
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor
@@ -3355,7 +3392,11 @@ class GPUModelRunner(
                 # Common case.
                 aux_hidden_states = None
                 if (
-                    (self._split_forward_capture_hb or self._debug_save_hb)
+                    (
+                        self._split_forward_capture_hb
+                        or self._debug_save_hb
+                        or self._debug_suffix_kv_prefill
+                    )
                     and isinstance(model_output, tuple)
                     and len(model_output) == 2
                     and isinstance(model_output[1], torch.Tensor)
@@ -3426,6 +3467,21 @@ class GPUModelRunner(
                                 hidden_states,
                                 num_tokens_unpadded,
                             )
+                if is_prefill and self._debug_suffix_kv_prefill:
+                    with set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        cudagraph_runtime_mode=cudagraph_mode,
+                        batch_descriptor=batch_desc,
+                        ubatch_slices=ubatch_slices_padded,
+                    ):
+                        self._run_suffix_kv_prefill_from_hb(
+                            hb,
+                            positions,
+                            num_tokens_unpadded,
+                        )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4529,7 +4585,11 @@ class GPUModelRunner(
                 hidden_states, _ = outputs
             else:
                 if (
-                    (self._split_forward_capture_hb or self._debug_save_hb)
+                    (
+                        self._split_forward_capture_hb
+                        or self._debug_save_hb
+                        or self._debug_suffix_kv_prefill
+                    )
                     and isinstance(outputs, tuple)
                     and len(outputs) == 2
                     and isinstance(outputs[1], torch.Tensor)

@@ -412,6 +412,7 @@ class LlamaModel(nn.Module):
         self.split_forward_boundary = envs.VLLM_SPLIT_FORWARD_BOUNDARY
         self.split_forward_capture_hb = envs.VLLM_SPLIT_FORWARD_CAPTURE_HB
         self.debug_save_hb = envs.VLLM_DEBUG_SAVE_HB
+        self.debug_suffix_kv_prefill = envs.VLLM_DEBUG_SUFFIX_KV_PREFILL
         self.debug_boundary_layer = envs.VLLM_DEBUG_BOUNDARY_LAYER
         if self.split_forward_enabled:
             if self.split_forward_boundary is None:
@@ -435,6 +436,17 @@ class LlamaModel(nn.Module):
                     f"VLLM_DEBUG_BOUNDARY_LAYER={self.debug_boundary_layer} must be "
                     f"between 0 and {config.num_hidden_layers}"
                 )
+        if self.debug_suffix_kv_prefill:
+            if self.debug_boundary_layer is None:
+                raise ValueError(
+                    "VLLM_DEBUG_BOUNDARY_LAYER must be set when "
+                    "VLLM_DEBUG_SUFFIX_KV_PREFILL is True"
+                )
+            if not (0 < self.debug_boundary_layer < config.num_hidden_layers):
+                raise ValueError(
+                    f"VLLM_DEBUG_BOUNDARY_LAYER={self.debug_boundary_layer} must be "
+                    f"between 0 and {config.num_hidden_layers}"
+                )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -452,7 +464,7 @@ class LlamaModel(nn.Module):
         | tuple[torch.Tensor, torch.Tensor]
     ):
         # Check if split-forward is enabled
-        if self.split_forward_enabled or self.debug_save_hb:
+        if self.split_forward_enabled or self.debug_save_hb or self.debug_suffix_kv_prefill:
             boundary_layer = (
                 self.split_forward_boundary
                 if self.split_forward_enabled
@@ -462,7 +474,11 @@ class LlamaModel(nn.Module):
             H_B = self.forward_trunk(
                 input_ids, positions, boundary_layer, inputs_embeds
             )
-            need_return_hb = self.split_forward_capture_hb or self.debug_save_hb
+            need_return_hb = (
+                self.split_forward_capture_hb
+                or self.debug_save_hb
+                or self.debug_suffix_kv_prefill
+            )
             H_B_for_suffix = H_B.clone() if need_return_hb else H_B
             hidden_states = self.forward_suffix(
                 H_B_for_suffix, positions, boundary_layer
@@ -864,6 +880,14 @@ class LlamaForCausalLM(
         )
         logits = self.compute_logits(last_hidden)
         return logits[0]
+
+    def forward_suffix_prefill_from_hb(
+        self,
+        hb: torch.Tensor,
+        positions: torch.Tensor,
+        boundary_layer: int,
+    ) -> torch.Tensor:
+        return self.model.forward_suffix(hb, positions, boundary_layer)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(
