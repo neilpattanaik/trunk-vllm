@@ -24,7 +24,8 @@ class BoundaryStore:
         hb_chunk = hb_chunk.detach()
         if hb_chunk.device != self.device or hb_chunk.dtype != self.dtype:
             hb_chunk = hb_chunk.to(device=self.device, dtype=self.dtype)
-        hb_chunk = hb_chunk.contiguous()
+        # Make a local copy to avoid aliasing if the source buffer is mutated.
+        hb_chunk = hb_chunk.clone()
         self._store.setdefault(req_id, []).append(hb_chunk)
 
     def get_prefix(self, req_id: str, total_len: int) -> torch.Tensor:

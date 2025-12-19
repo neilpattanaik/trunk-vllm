@@ -438,13 +438,10 @@ class LlamaModel(nn.Module):
             H_B = self.forward_trunk(
                 input_ids, positions, boundary_layer, inputs_embeds
             )
-            H_B_for_suffix = H_B
             if boundary_capture is not None:
+                # Capture hook owns any persistence/copy semantics.
                 boundary_capture(H_B)
-                H_B_for_suffix = H_B.clone()
-            hidden_states = self.forward_suffix(
-                H_B_for_suffix, positions, boundary_layer
-            )
+            hidden_states = self.forward_suffix(H_B, positions, boundary_layer)
             return hidden_states
 
         # Standard forward path

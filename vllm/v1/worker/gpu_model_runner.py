@@ -3711,13 +3711,26 @@ class GPUModelRunner(
         ):
             def _boundary_capture(hb: torch.Tensor) -> None:
                 nonlocal hb_for_debug
-                hb_for_debug = hb
                 self._capture_boundary_hb(
                     hb,
                     self.input_batch.req_ids,
                     num_scheduled_tokens_np,
                     num_tokens_unpadded,
                 )
+                if (
+                    self._debug_save_hb
+                    or self._debug_suffix_kv_prefill
+                    or self._debug_suffix_only_from_hb_path
+                ):
+                    # Store only the first non-empty request slice.
+                    offset = 0
+                    for num_tokens in num_scheduled_tokens_np.tolist():
+                        if num_tokens <= 0:
+                            continue
+                        hb_for_debug = hb[
+                            offset : offset + num_tokens
+                        ].detach().clone()
+                        break
 
             boundary_capture = _boundary_capture
 
@@ -3736,7 +3749,7 @@ class GPUModelRunner(
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
-        ):
+            ):
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
