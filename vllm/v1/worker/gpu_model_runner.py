@@ -112,6 +112,7 @@ from vllm.v1.attention.backends.utils import (
     split_attn_metadata,
 )
 from vllm.v1.worker.shared_trunk.boundary_store import BoundaryStore
+from vllm.v1.worker.shared_trunk.decoding_profile import DecodingProfile
 from vllm.v1.worker.shared_trunk.suffix_cache_manager import SuffixCacheManager
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -308,6 +309,16 @@ class GPUModelRunner(
         self._debug_suffix_switch_store: dict[str, dict[str, Any]] = {}
         self._debug_suffix_switch_done: set[str] = set()
         self._pending_suffix_switch: dict[str, dict[str, int]] = {}
+        self._kv_caches_by_layer: dict[str, torch.Tensor] | None = None
+        self._profile_force_eos_bias = 1e4
+        self._decoding_profiles = {
+            0: DecodingProfile(eos_logit_bias=5.0, max_tokens_cap=64),
+            1: DecodingProfile(),
+        }
+        eos_token_id = getattr(self.model_config.hf_config, "eos_token_id", None)
+        if isinstance(eos_token_id, (list, tuple, set)):
+            eos_token_id = next(iter(eos_token_id), None)
+        self._eos_token_id = eos_token_id
         self._suffix_cache_mgr: SuffixCacheManager | None = None
         self._boundary_store: BoundaryStore | None = None
         self._split_forward_active = (
@@ -897,6 +908,59 @@ class GPUModelRunner(
             req_id = new_req_data.req_id
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
+            suffix_id = 1
+            suffix_switch_after: int | None = None
+            suffix_switch_id: int | None = None
+            suffix_switch_control_ids: list[int] | None = None
+            if sampling_params and sampling_params.extra_args:
+                extra_args = sampling_params.extra_args
+                if "vllm_suffix_id" in extra_args:
+                    suffix_id = int(extra_args["vllm_suffix_id"])
+                if "vllm_suffix_switch_after" in extra_args:
+                    suffix_switch_after = int(
+                        extra_args["vllm_suffix_switch_after"]
+                    )
+                if "vllm_suffix_switch_to" in extra_args:
+                    suffix_switch_id = int(extra_args["vllm_suffix_switch_to"])
+                if "vllm_suffix_switch_control_ids" in extra_args:
+                    suffix_switch_control_ids = list(
+                        extra_args["vllm_suffix_switch_control_ids"]
+                    )
+                if suffix_id not in (0, 1):
+                    raise ValueError(f"Invalid vllm_suffix_id={suffix_id}.")
+                if suffix_switch_after is not None and suffix_switch_after <= 0:
+                    raise ValueError(
+                        "vllm_suffix_switch_after must be positive if set."
+                    )
+                if suffix_switch_after is not None and suffix_switch_id is None:
+                    raise ValueError(
+                        "vllm_suffix_switch_to must be set when "
+                        "vllm_suffix_switch_after is provided."
+                    )
+                if (
+                    suffix_switch_id is not None
+                    and suffix_switch_id not in (0, 1)
+                ):
+                    raise ValueError(
+                        f"Invalid vllm_suffix_switch_to={suffix_switch_id}."
+                    )
+                if suffix_switch_control_ids is not None:
+                    if not suffix_switch_control_ids:
+                        suffix_switch_control_ids = None
+                    else:
+                        if any(
+                            not isinstance(tok, int)
+                            for tok in suffix_switch_control_ids
+                        ):
+                            raise ValueError(
+                                "vllm_suffix_switch_control_ids must be ints."
+                            )
+                        if len(suffix_switch_control_ids) > 32:
+                            raise ValueError(
+                                "vllm_suffix_switch_control_ids length must be <= 32."
+                            )
+                if suffix_switch_after is not None or suffix_switch_id is not None:
+                    self._ensure_suffix_switch_resources()
 
             if (
                 sampling_params
@@ -928,6 +992,10 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                suffix_id=suffix_id,
+                suffix_switch_after=suffix_switch_after,
+                suffix_switch_id=suffix_switch_id,
+                suffix_switch_control_ids=suffix_switch_control_ids,
             )
             self.requests[req_id] = req_state
 
@@ -1121,10 +1189,26 @@ class GPUModelRunner(
         num_scheduled_tokens_np: np.ndarray,
         num_tokens_unpadded: int,
     ) -> None:
-        if not (self._split_forward_capture_hb or self._debug_suffix_switch):
+        has_suffix_switch = False
+        if self._pending_suffix_switch or self._debug_suffix_switch:
+            has_suffix_switch = True
+        else:
+            for req_id in req_ids:
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    continue
+                if (
+                    req_state.suffix_switch_after is not None
+                    or req_state.suffix_switch_id is not None
+                ):
+                    has_suffix_switch = True
+                    break
+        if not (self._split_forward_capture_hb or has_suffix_switch):
             return
         if num_tokens_unpadded <= 0:
             return
+        if has_suffix_switch and self._boundary_store is None:
+            self._ensure_suffix_switch_resources()
 
         hb = hb[:num_tokens_unpadded]
         offset = 0
@@ -1135,10 +1219,17 @@ class GPUModelRunner(
             offset += num_tokens
             if hb_slice.numel() == 0:
                 continue
-            if (
-                self._debug_suffix_switch
-                and req_id not in self._debug_suffix_switch_store
-            ):
+            capture_for_switch = self._debug_suffix_switch
+            if not capture_for_switch:
+                req_state = self.requests.get(req_id)
+                if req_state is not None:
+                    if (
+                        req_state.suffix_switch_after is not None
+                        or req_state.suffix_switch_id is not None
+                        or req_id in self._pending_suffix_switch
+                    ):
+                        capture_for_switch = True
+            if self._debug_suffix_switch and req_id not in self._debug_suffix_switch_store:
                 req_state = self.requests.get(req_id)
                 prompt_len = (
                     req_state.num_prompt_tokens if req_state is not None else None
@@ -1150,12 +1241,12 @@ class GPUModelRunner(
                     "boundary_layer": self._debug_boundary_layer,
                     "switch_after": self._debug_switch_after,
                 }
-                if self._boundary_store is not None:
-                    self._boundary_store.init_for_request(req_id)
             hb_slice = hb_slice.detach()
-            if self._debug_suffix_switch:
+            if capture_for_switch:
                 if self._boundary_store is None:
                     raise RuntimeError("Boundary store is not initialized.")
+                if not self._boundary_store.has_request(req_id):
+                    self._boundary_store.init_for_request(req_id)
                 self._boundary_store.append(req_id, hb_slice)
             if self._split_forward_capture_hb:
                 hb_cpu = hb_slice
@@ -1353,13 +1444,7 @@ class GPUModelRunner(
             return
         if self._debug_boundary_layer is None:
             raise RuntimeError("VLLM_DEBUG_BOUNDARY_LAYER must be set.")
-        self._suffix_cache_mgr = SuffixCacheManager(
-            boundary_layer=self._debug_boundary_layer,
-        )
-        self._suffix_cache_mgr.initialize_from_kv_caches(
-            self.vllm_config,
-            kv_caches,
-        )
+        self._init_suffix_switch_kv_cache(kv_caches, self._debug_boundary_layer)
 
     def _compute_slot_mapping_for_req(
         self,
@@ -1480,6 +1565,8 @@ class GPUModelRunner(
         suffix_id: int,
         target_len: int,
         prompt_len: int | None = None,
+        control_text: str | None = None,
+        control_token_ids: list[int] | None = None,
     ) -> None:
         if not req_id:
             raise ValueError("req_id must be non-empty.")
@@ -1487,6 +1574,18 @@ class GPUModelRunner(
             raise ValueError(f"suffix_id must be 0 or 1, got {suffix_id}.")
         if target_len <= 0:
             raise ValueError(f"target_len must be positive, got {target_len}.")
+        if control_text and control_token_ids is None:
+            raise RuntimeError(
+                "control_text must be tokenized before reaching the runner."
+            )
+        if control_token_ids is not None:
+            if not control_token_ids:
+                control_token_ids = None
+            else:
+                if any(not isinstance(tok, int) for tok in control_token_ids):
+                    raise ValueError("control_token_ids must be ints.")
+                if len(control_token_ids) > 32:
+                    raise ValueError("control_token_ids length must be <= 32.")
         if prompt_len is None:
             req_state = self.requests.get(req_id)
             if req_state is None:
@@ -1498,6 +1597,7 @@ class GPUModelRunner(
             "suffix_id": suffix_id,
             "target_len": int(target_len),
             "prompt_len": int(prompt_len),
+            "control_token_ids": control_token_ids or [],
         }
 
     def _execute_suffix_switch(
@@ -1507,9 +1607,15 @@ class GPUModelRunner(
         suffix_id: int,
         target_len: int,
         prompt_len: int,
+        control_token_ids: list[int] | None = None,
     ) -> None:
         if self.input_batch.num_reqs != 1:
             raise RuntimeError("Suffix switch only supports batch size 1.")
+        if control_token_ids:
+            if self.input_batch.num_reqs != 1:
+                raise RuntimeError(
+                    "Suffix switch control text only supports batch size 1."
+                )
         boundary_layer = (
             self._debug_boundary_layer
             if self._debug_boundary_layer is not None
@@ -1541,6 +1647,56 @@ class GPUModelRunner(
             build_prefill_attn_metadata=self._build_suffix_switch_attn_metadata,
             build_decode_attn_metadata=self._build_suffix_switch_decode_attn_metadata,
         )
+        req_state = self.requests.get(req_id)
+        if req_state is not None:
+            req_state.suffix_id = suffix_id
+            req_state.suffix_switch_after = None
+            req_state.suffix_switch_id = None
+            if control_token_ids:
+                req_state.forced_token_ids.extend(control_token_ids)
+
+    def _init_suffix_switch_kv_cache(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        boundary_layer: int,
+    ) -> None:
+        self._suffix_cache_mgr = SuffixCacheManager(
+            boundary_layer=boundary_layer,
+        )
+        self._suffix_cache_mgr.initialize_from_kv_caches(
+            self.vllm_config,
+            kv_caches,
+        )
+
+    def _ensure_suffix_switch_resources(self) -> None:
+        boundary_layer = self._split_forward_boundary_active
+        if boundary_layer is None:
+            boundary_layer = self._split_forward_boundary
+            if boundary_layer is None:
+                boundary_layer = self._debug_boundary_layer
+        if boundary_layer is None:
+            raise RuntimeError(
+                "Boundary layer must be set for suffix switching."
+            )
+        num_layers = self.model_config.hf_config.num_hidden_layers
+        if not (0 < boundary_layer < num_layers):
+            raise RuntimeError(
+                f"Boundary layer {boundary_layer} must be between 0 and "
+                f"{num_layers}."
+            )
+        self._split_forward_boundary_active = boundary_layer
+        self._split_forward_active = True
+        if self._boundary_store is None:
+            self._boundary_store = BoundaryStore(
+                device=self.device,
+                dtype=self.dtype,
+            )
+        if self._suffix_cache_mgr is None:
+            if self._kv_caches_by_layer is None:
+                raise RuntimeError("KV caches are not initialized.")
+            self._init_suffix_switch_kv_cache(
+                self._kv_caches_by_layer, boundary_layer
+            )
 
     def _maybe_execute_suffix_switch(
         self,
@@ -1558,6 +1714,7 @@ class GPUModelRunner(
             return
         target_len = pending["target_len"]
         prompt_len = pending["prompt_len"]
+        control_token_ids = pending.get("control_token_ids") or []
         if self._boundary_store is None:
             raise RuntimeError("Boundary store is not initialized.")
         if self._boundary_store.num_tokens(req_id) < target_len:
@@ -1567,6 +1724,7 @@ class GPUModelRunner(
             suffix_id=pending["suffix_id"],
             target_len=target_len,
             prompt_len=prompt_len,
+            control_token_ids=control_token_ids,
         )
         self._pending_suffix_switch.pop(req_id, None)
         if self._debug_suffix_switch:
@@ -1576,6 +1734,33 @@ class GPUModelRunner(
         self,
         is_prefill: bool,
     ) -> None:
+        if not is_prefill:
+            if self.input_batch.num_reqs != 1 and (
+                self._debug_suffix_switch or self._pending_suffix_switch
+            ):
+                raise RuntimeError("Suffix switch only supports batch size 1.")
+            if self.input_batch.num_reqs == 1:
+                req_id = self.input_batch.req_ids[0]
+                req_state = self.requests.get(req_id)
+                if (
+                    req_state is not None
+                    and req_state.suffix_switch_after is not None
+                    and req_state.suffix_switch_id is not None
+                    and req_id not in self._pending_suffix_switch
+                ):
+                    req_idx = 0
+                    prompt_len = int(self.input_batch.num_prompt_tokens[req_idx])
+                    num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
+                    target_len = prompt_len + req_state.suffix_switch_after
+                    if num_computed >= target_len:
+                        self.request_suffix_switch(
+                            req_id,
+                            suffix_id=req_state.suffix_switch_id,
+                            target_len=target_len,
+                            prompt_len=prompt_len,
+                            control_token_ids=req_state.suffix_switch_control_ids,
+                        )
+
         if self._debug_suffix_switch and not is_prefill:
             if self.input_batch.num_reqs != 1:
                 raise RuntimeError("Debug suffix switch only supports batch size 1.")
@@ -1591,12 +1776,13 @@ class GPUModelRunner(
                 prompt_len = int(self.input_batch.num_prompt_tokens[req_idx])
                 num_computed = int(self.input_batch.num_computed_tokens_cpu[req_idx])
                 target_len = prompt_len + self._debug_switch_after
-                if num_computed == target_len:
+                if num_computed >= target_len:
                     self.request_suffix_switch(
                         req_id,
                         suffix_id=1,
                         target_len=target_len,
                         prompt_len=prompt_len,
+                        control_token_ids=None,
                     )
 
         self._maybe_execute_suffix_switch(is_prefill)
@@ -3234,13 +3420,18 @@ class GPUModelRunner(
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        if logits is not None:
+            self._apply_decoding_profiles(logits, spec_decode_metadata)
         if spec_decode_metadata is None:
             # Update output token ids with tokens sampled in last step
             # if async scheduling and required by current sampling params.
             self.input_batch.update_async_output_token_ids()
-            return self.sampler(
+            sampler_output = self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
+            )
+            return self._apply_forced_tokens(
+                sampler_output, logits, sampling_metadata
             )
 
         sampler_output = self.rejection_sampler(
@@ -3250,7 +3441,124 @@ class GPUModelRunner(
             sampling_metadata,
         )
         self._update_states_after_model_execute(sampler_output.sampled_token_ids)
-        return sampler_output
+        return self._apply_forced_tokens(
+            sampler_output, logits, sampling_metadata
+        )
+
+    def _apply_decoding_profiles(
+        self,
+        logits: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> None:
+        req_ids = self.input_batch.req_ids
+        if not req_ids:
+            return
+
+        profiles_active = False
+        for req_id in req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            profile = self._decoding_profiles.get(
+                req_state.suffix_id, self._decoding_profiles[1]
+            )
+            if (
+                profile.eos_logit_bias
+                or profile.max_tokens_cap is not None
+                or profile.min_tokens_floor is not None
+            ):
+                profiles_active = True
+                break
+
+        if not profiles_active:
+            return
+        if spec_decode_metadata is not None:
+            raise RuntimeError(
+                "Decoding profiles are not supported with speculative decoding."
+            )
+        if logits.shape[0] != len(req_ids):
+            raise RuntimeError(
+                "Logits rows do not match request count for decoding profiles."
+            )
+
+        for row_idx, req_id in enumerate(req_ids):
+            req_state = self.requests.get(req_id)
+            if req_state is None:
+                continue
+            profile = self._decoding_profiles.get(
+                req_state.suffix_id, self._decoding_profiles[1]
+            )
+            stop_ids: set[int] = set()
+            if req_state.sampling_params is not None:
+                stop_ids.update(req_state.sampling_params.all_stop_token_ids)
+            if not stop_ids and self._eos_token_id is not None:
+                stop_ids.add(self._eos_token_id)
+            if not stop_ids:
+                continue
+            eos_bias = profile.eos_logit_bias
+            output_len = len(req_state.output_token_ids)
+            if profile.max_tokens_cap is not None and output_len >= profile.max_tokens_cap:
+                # Force a stop token once the cap is reached.
+                logits[row_idx].fill_(-float("inf"))
+                for stop_id in stop_ids:
+                    logits[row_idx, stop_id] = 0.0
+                continue
+            if profile.min_tokens_floor is not None and output_len < profile.min_tokens_floor:
+                eos_bias = min(eos_bias, -self._profile_force_eos_bias)
+        if eos_bias:
+            for stop_id in stop_ids:
+                logits[row_idx, stop_id] += eos_bias
+
+    def _apply_forced_tokens(
+        self,
+        sampler_output: SamplerOutput,
+        logits: torch.Tensor | None,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput:
+        req_ids = self.input_batch.req_ids
+        if not req_ids:
+            return sampler_output
+        if self.input_batch.num_reqs != 1:
+            for req_id in req_ids:
+                req_state = self.requests.get(req_id)
+                if req_state is not None and req_state.forced_token_ids:
+                    raise RuntimeError(
+                        "Forced tokens only support batch size 1."
+                    )
+            return sampler_output
+        req_id = req_ids[0]
+        req_state = self.requests.get(req_id)
+        if req_state is None or not req_state.forced_token_ids:
+            return sampler_output
+        forced_token = req_state.forced_token_ids.pop(0)
+        sampler_output.sampled_token_ids[0, 0] = int(forced_token)
+        if (
+            sampler_output.logprobs_tensors is None
+            or logits is None
+            or sampling_metadata.max_num_logprobs is None
+        ):
+            return sampler_output
+
+        raw_logprobs = self.sampler.compute_logprobs(logits)
+        if sampling_metadata.max_num_logprobs == -1:
+            logprobs_tensors = LogprobsTensors(
+                torch.empty(0),
+                raw_logprobs,
+                torch.empty(0),
+            )
+        else:
+            token_ids = torch.tensor(
+                [forced_token], device=logits.device, dtype=torch.int64
+            )
+            logprobs_tensors = self.sampler.gather_logprobs(
+                raw_logprobs,
+                sampling_metadata.max_num_logprobs,
+                token_ids,
+            )
+        return SamplerOutput(
+            sampled_token_ids=sampler_output.sampled_token_ids,
+            logprobs_tensors=logprobs_tensors,
+        )
 
     def _bookkeeping_sync(
         self,
@@ -3786,11 +4094,26 @@ class GPUModelRunner(
 
         hb_for_debug: torch.Tensor | None = None
         boundary_capture = None
+        needs_suffix_switch = False
+        if self._pending_suffix_switch:
+            needs_suffix_switch = True
+        else:
+            for req_id in self.input_batch.req_ids:
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    continue
+                if (
+                    req_state.suffix_switch_after is not None
+                    or req_state.suffix_switch_id is not None
+                ):
+                    needs_suffix_switch = True
+                    break
         if self._split_forward_active and (
             self._split_forward_capture_hb
             or self._debug_save_hb
             or self._debug_suffix_kv_prefill
             or self._debug_suffix_switch
+            or needs_suffix_switch
         ):
             def _boundary_capture(hb: torch.Tensor) -> None:
                 nonlocal hb_for_debug
@@ -6201,6 +6524,7 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        self._kv_caches_by_layer = kv_caches
         if self._debug_suffix_switch:
             self._init_debug_suffix_switch_kv_cache(kv_caches)
 

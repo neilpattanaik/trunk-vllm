@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast
 
 import numpy as np
@@ -49,6 +49,13 @@ class CachedRequestState:
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0
+
+    # Suffix switching / decoding profile.
+    suffix_id: int = 1
+    suffix_switch_after: int | None = None
+    suffix_switch_id: int | None = None
+    suffix_switch_control_ids: list[int] | None = None
+    forced_token_ids: list[int] = field(default_factory=list)
 
     # for pooling models
     pooling_params: PoolingParams | None = None

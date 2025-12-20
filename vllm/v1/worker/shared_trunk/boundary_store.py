@@ -16,6 +16,9 @@ class BoundaryStore:
     def init_for_request(self, req_id: str) -> None:
         self._store[req_id] = []
 
+    def has_request(self, req_id: str) -> bool:
+        return req_id in self._store
+
     def append(self, req_id: str, hb_chunk: torch.Tensor) -> None:
         if hb_chunk.dim() == 3 and hb_chunk.size(0) == 1:
             hb_chunk = hb_chunk[0]

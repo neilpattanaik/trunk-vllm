@@ -504,6 +504,29 @@ class InputProcessor:
             )
             if self.tokenizer is not None:
                 sampling_params.update_from_tokenizer(self.tokenizer)
+            if (
+                sampling_params.extra_args
+                and "vllm_suffix_switch_control_text"
+                in sampling_params.extra_args
+            ):
+                if self.tokenizer is None:
+                    raise RuntimeError(
+                        "Tokenizer is required for suffix switch control text."
+                    )
+                control_text = sampling_params.extra_args.get(
+                    "vllm_suffix_switch_control_text"
+                )
+                if control_text:
+                    control_ids = self.tokenizer.encode(
+                        str(control_text), add_special_tokens=False
+                    )
+                    if len(control_ids) > 32:
+                        raise ValueError(
+                            "Control text tokenized length must be <= 32 tokens."
+                        )
+                    sampling_params.extra_args[
+                        "vllm_suffix_switch_control_ids"
+                    ] = control_ids
         else:
             pooling_params = params.clone()
 
